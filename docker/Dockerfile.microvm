@@ -1,0 +1,44 @@
+# MicroVM image for the wdl-chat sandbox. Built by Lambda MicroVMs (not local
+# docker) from the zip uploaded to S3 ({ Dockerfile, sandbox-agent/ })
+# via scripts/build-microvm-image.sh; the base is the FROM below.
+#
+# One MicroVM == one session. server.js runs as root (PID 1 via tini) and
+# drops AI subprocesses to the single `sandbox` uid via gosu. The ns token is
+# NOT in root's environ — it arrives at runtime via /init and is deliberately
+# handed to each AI command's child env as ADMIN_TOKEN (AI-visible by design);
+# the boundary is the VM + uid, not env secrecy.
+FROM node:24-bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    git ca-certificates tini gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the pinned CLI + pnpm from npm (`wdl` and `pnpm` auto-link onto PATH). /opt/wdl-cli is a
+# symlink to the CLI package so pack.js, the read allowlist, the prompt, and WDL_CLI_LOCAL_PATH keep
+# using /opt/wdl-cli/{lib,docs,examples}. --omit=dev keeps wrangler's optionalDependencies (platform
+# esbuild/workerd) so a dry-run doesn't fetch them at runtime.
+RUN npm install -g pnpm @wdl-dev/cli@1.3.1 --omit=dev --no-audit --no-fund \
+    && ln -s "$(npm root -g)/@wdl-dev/cli" /opt/wdl-cli \
+    && ln -s /opt/wdl-cli/node_modules/.bin/wrangler /usr/local/bin/wrangler
+ENV WDL_CLI_LOCAL_PATH=/opt/wdl-cli
+
+COPY sandbox-agent /opt/sandbox-agent
+RUN chmod +x /opt/sandbox-agent/scripts/wrangler-shim.mjs
+
+# Single non-root sandbox user (uid 2000). node:24-bookworm-slim ships its own
+# uid 1000 'node' user; remove it before claiming 2000. /workspace mode 0711 =
+# traverse-only: the sandbox uid can cd into its own /workspace/<sid>/ (0700)
+# but cannot ls into anything it does not own.
+RUN (userdel -r node 2>/dev/null || true) \
+    && useradd -m -u 2000 sandbox \
+    && mkdir /workspace \
+    && chmod 0711 /workspace \
+    && chown root:root /workspace
+
+# Catches missing production deps before the snapshot is taken.
+RUN node -e "import('/opt/wdl-cli/lib/wrangler-pack.js').then(m => { if (!m.packWranglerProject) throw new Error('packWranglerProject not exported'); console.log('lib/wrangler-pack.js OK'); })"
+
+# No USER directive — gosu requires we stay root in the entrypoint.
+WORKDIR /opt/sandbox-agent
+ENTRYPOINT ["/usr/bin/tini", "--", "node", "/opt/sandbox-agent/server.js"]
+EXPOSE 8080

@@ -1,0 +1,12 @@
+# Excludes for a local `docker build` of docker/Dockerfile.microvm. The shipping
+# image is built by Lambda from a zip (scripts/build-microvm-image.sh) with its
+# own excludes, so this file only matters if you build the image locally.
+**/.env
+**/.env.*
+**/.dev.vars
+**/.dev.vars.*
+**/node_modules
+**/.git
+**/.deploy-dist
+**/.wrangler
+**/*.log

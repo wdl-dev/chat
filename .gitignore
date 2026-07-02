@@ -1,0 +1,14 @@
+node_modules/
+.deploy-dist/
+.wrangler/
+dist/
+build/
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+.DS_Store
+*.log
+.vscode/
+.idea/
+coverage/

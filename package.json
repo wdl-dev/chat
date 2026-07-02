@@ -1,0 +1,28 @@
+{
+  "name": "wdl-chat",
+  "version": "0.0.1",
+  "private": true,
+  "description": "A WDL Worker that builds WDL Workers — an AI agent running on WDL that generates, previews, and deploys WDL Worker code",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "git+https://github.com/wdl-dev/chat.git" },
+  "homepage": "https://chat.wdl.dev",
+  "type": "module",
+  "workspaces": [
+    "sandbox-agent",
+    "workers/sandbox-broker",
+    "workers/chat",
+    "workers/frontend"
+  ],
+  "scripts": {
+    "test": "node --test workers/*/test/*.test.js sandbox-agent/test/*.test.js",
+    "check": "git ls-files '*.js' '*.mjs' | xargs -n1 node --check",
+    "test:e2e": "node --test tests/e2e/*.test.js",
+    "deploy:sandbox-broker": "cd workers/sandbox-broker && wdl deploy . --ns demo",
+    "deploy:chat": "cd workers/chat && wdl deploy . --ns demo",
+    "deploy:frontend": "cd workers/frontend && wdl deploy . --ns demo",
+    "bootstrap": "node scripts/bootstrap.js"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

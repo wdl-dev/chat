@@ -1,0 +1,13 @@
+{
+  "name": "@wdl-chat/chat-worker",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:agents-md": "node ../../scripts/build-agents-md.mjs",
+    "dry-run": "wrangler deploy --dry-run --outdir=.deploy-dist"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

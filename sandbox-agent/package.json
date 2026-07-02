@@ -1,0 +1,15 @@
+{
+  "name": "@wdl-chat/sandbox-agent",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/**/*.test.js"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=24"
+  }
+}

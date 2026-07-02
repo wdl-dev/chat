@@ -1,0 +1,461 @@
+/* WDL-CHAT — visual layer for the wdl-chat console.
+   Brand-aligned to wdl.dev: minimalist-technical, blue accent on near-black-blue
+   paper, hairline rules, monospace for system/meta, system-sans for prose.
+   Dark-only by intent — it's a console. The portal is the one bold moment
+   (a terminal-prompt gate over a faint dispatch lattice); the chat view stays
+   quiet and disciplined. Class/id names match what app.js emits — restyle only. */
+
+:root {
+  color-scheme: dark;
+
+  --paper:      #0d0e11;   /* page */
+  --raised:     #15171c;   /* elevated surfaces */
+  --inset:      #0a0b0f;   /* terminal / code / inputs */
+  --ink:        #e9e9e3;   /* primary text */
+  --muted:      #9298a1;   /* secondary text */
+  --faint:      #6a6f78;   /* meta / disabled */
+  --line:       #23252c;   /* hairline */
+  --line-2:     #31343d;   /* stronger hairline */
+
+  --accent:        #7b8fff;
+  --accent-2:      #9aa9ff;                       /* hover */
+  --accent-ink:    #0b0d18;                       /* text on accent fill */
+  --accent-soft:   rgba(123, 143, 255, 0.10);
+  --accent-ring:   rgba(123, 143, 255, 0.30);
+  --lattice:       rgba(123, 143, 255, 0.06);
+
+  --ok:   #46c79f;
+  --warn: #e0a85a;
+  --bad:  #ef6f6f;
+
+  --sans: -apple-system, "SF Pro Text", "Inter", system-ui,
+          "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Menlo", "Consolas", monospace;
+
+  --r:    10px;
+  --r-sm: 7px;
+  --r-xs: 5px;
+}
+
+* { box-sizing: border-box; }
+/* dvh tracks the visible viewport as mobile browser chrome shows/hides, so
+   the footer stays on-screen; 100vh is the fallback for older engines. */
+html, body { height: 100vh; height: 100dvh; }
+body {
+  margin: 0; display: flex; flex-direction: column;
+  background: var(--paper); color: var(--ink);
+  font-family: var(--sans); font-size: 15px; line-height: 1.6;
+  -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+button { font: inherit; cursor: pointer; border: 0; background: none; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Eyebrow — mono, spaced, uppercase. The brand's labelling device. */
+.eyebrow {
+  display: block;
+  font-family: var(--mono); font-size: 0.68rem; font-weight: 500;
+  letter-spacing: 0.22em; text-transform: uppercase; color: var(--faint);
+}
+
+/* WDL mark (inline <symbol>, themed via currentColor). */
+.logo-mark { display: block; color: var(--ink); }
+
+/* ============================================================ Portal
+   Signature: a terminal-prompt gate floating over a faint dispatch lattice. */
+#portal {
+  position: relative; flex: 1;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 1.1rem; padding: 2rem 1.2rem; overflow: hidden;
+}
+#portal::before {                 /* the lattice — faint, fades out from center */
+  content: ""; position: absolute; inset: -1px; pointer-events: none;
+  background:
+    repeating-linear-gradient(0deg,  var(--lattice) 0 1px, transparent 1px 44px),
+    repeating-linear-gradient(90deg, var(--lattice) 0 1px, transparent 1px 44px);
+  -webkit-mask: radial-gradient(115% 80% at 50% 42%, #000 0%, transparent 68%);
+          mask: radial-gradient(115% 80% at 50% 42%, #000 0%, transparent 68%);
+}
+.portal-card {
+  position: relative; z-index: 1;
+  width: 100%; max-width: 430px;
+  padding: 2.5rem 2.1rem 2.1rem;
+  text-align: center;
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 24px 70px -34px rgba(0, 0, 0, 0.7);
+}
+.portal-logo { width: 46px; height: 46px; margin: 0 auto 1.15rem; color: var(--ink); }
+
+/* Language toggle, top-right of the portal card (pre-session only; the choice
+   locks once a session starts, so the chat view has no switch). */
+.portal-lang {
+  position: absolute; top: 0.85rem; right: 0.85rem;
+  display: inline-flex; gap: 2px; padding: 2px;
+  border: 1px solid var(--line); border-radius: 999px; background: var(--inset);
+}
+.portal-lang .lang-opt {
+  appearance: none; cursor: pointer; border: 0; border-radius: 999px;
+  padding: 0.18rem 0.6rem; background: transparent; color: var(--faint);
+  font-family: var(--mono); font-size: 0.7rem; letter-spacing: 0.04em;
+  transition: color .15s ease, background .15s ease;
+}
+.portal-lang .lang-opt:hover { color: var(--muted); }
+.portal-lang .lang-opt.active { background: var(--accent-soft); color: var(--accent-2); }
+.portal-card .eyebrow { margin-bottom: 0.55rem; }
+.portal-wordmark {
+  margin: 0; font-family: var(--mono); font-weight: 600;
+  font-size: 1.5rem; letter-spacing: 0.14em; color: var(--ink);
+}
+.portal-wordmark .dot { color: var(--accent); }
+.portal-sub {
+  margin: 1rem auto 1.6rem; max-width: 32ch;
+  color: var(--muted); font-size: 0.88rem; line-height: 1.65;
+}
+
+/* the prompt row — the brand's terminal inset, made interactive */
+.portal-prompt {
+  display: flex; align-items: stretch;
+  padding-left: 0.85rem;          /* left room for the sigil; the button owns the right edge */
+  background: var(--inset);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  overflow: hidden;               /* clip the flush button to the box's rounded corners */
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.portal-prompt:focus-within {
+  border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.prompt-sigil {
+  align-self: center; margin-right: 0.55rem; flex-shrink: 0;
+  font-family: var(--mono); font-weight: 600; color: var(--accent); user-select: none;
+}
+.portal-input {
+  flex: 1; min-width: 0; align-self: center;
+  background: none; border: 0; outline: none;
+  color: var(--ink); font-family: var(--mono);
+  font-size: 0.9rem; letter-spacing: 0.06em; padding: 0.7rem 0;
+}
+.portal-input::placeholder { color: var(--faint); letter-spacing: normal; }
+.portal-submit {
+  flex-shrink: 0; align-self: stretch;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0 1.15rem; border: 0; border-radius: 0;
+  background: var(--accent); color: var(--accent-ink);
+  font-size: 0.85rem; font-weight: 600;
+  transition: background .15s ease;
+}
+.portal-submit:hover:not(:disabled) { background: var(--accent-2); }
+.portal-submit:disabled { opacity: 0.45; cursor: not-allowed; }
+.portal-error { margin: 0.85rem 0 0; min-height: 1em; color: var(--bad); font-size: 0.82rem; }
+.portal-foot {
+  position: relative; z-index: 1; margin: 0;
+  font-family: var(--mono); font-size: 0.72rem; color: var(--faint); opacity: 0.85;
+}
+
+/* ============================================================ Chat header */
+#chat-header {
+  display: flex; align-items: center; gap: 0.85rem; flex-wrap: nowrap;
+  padding: 0.8rem 1.4rem; border-bottom: 1px solid var(--line); background: var(--paper);
+}
+.header-logo { width: 22px; height: 22px; flex-shrink: 0; color: var(--ink); }
+.header-wordmark {
+  flex-shrink: 0;
+  font-family: var(--mono); font-weight: 600; font-size: 0.92rem;
+  letter-spacing: 0.1em; color: var(--ink);
+}
+.header-wordmark .dot { color: var(--accent); }
+/* session-id + status truncate so the actions never get pushed off-screen */
+.session-id {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--mono); font-size: 0.76rem; color: var(--faint);
+}
+.status-text {
+  flex: 1 1 auto;        /* fills the gap (pushes actions right) and truncates when cramped */
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 0.82rem; color: var(--muted);
+}
+.header-actions { flex-shrink: 0; display: flex; gap: 0.5rem; }
+
+.ghost {
+  padding: 0.42rem 0.9rem; border-radius: var(--r-sm);
+  border: 1px solid var(--line-2); color: var(--muted);
+  font-size: 0.82rem; transition: color .15s ease, border-color .15s ease;
+}
+.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--faint); }
+.ghost:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ============================================================ Layout
+   Default: a single centered conversation column. The side rail (preview +
+   steps) only takes space once there's a preview — otherwise it collapses, so
+   the chat reads as a contained column instead of floating in a void. */
+#chat-main { flex: 1; display: grid; grid-template-columns: 1fr; min-height: 0; }
+body.has-preview #chat-main { grid-template-columns: 1fr 52vw; }
+body.preview-expanded #chat-main { grid-template-columns: 0 1fr; }
+body.preview-expanded #messages { display: none; }
+#messages {
+  padding: 1.8rem max(1.5rem, calc((100% - 760px) / 2));
+  overflow-y: auto;
+  scrollbar-width: thin; scrollbar-color: var(--line-2) transparent;
+}
+#side { display: none; }
+body.has-preview #side {
+  padding: 1.4rem; border-left: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 1.3rem;
+  overflow: hidden; min-height: 0;
+}
+
+.panel-title {
+  display: flex; align-items: baseline;
+  margin: 0 0 0.7rem;
+  font-family: var(--mono); font-size: 0.68rem; font-weight: 500;
+  letter-spacing: 0.2em; text-transform: uppercase; color: var(--faint);
+}
+
+/* ============================================================ Messages
+   User = a contained accent chip on the right.
+   Assistant = open prose on the page (no bubble) — quiet, brand-flat. */
+.msg { margin: 0 0 1.5rem; word-break: break-word; }
+
+.msg-user {
+  width: fit-content; max-width: 85%; margin-left: auto;
+  padding: 0.7rem 1rem;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-ring);
+  border-radius: 12px 12px 4px 12px;
+  color: var(--ink);
+}
+.msg-user .msg-body { white-space: pre-wrap; }
+.msg-user .msg-time { text-align: right; }
+
+@keyframes cursor-blink { 50% { opacity: 0; } }
+.msg-time {
+  margin-top: 0.5rem;
+  font-family: var(--mono); font-size: 0.7rem; color: var(--faint); letter-spacing: 0.02em;
+}
+
+/* ============================================================ Agent turn
+   The agent's whole working sequence (until it hands back) is ONE block:
+   avatar (identity) on the left, a flowing body on the right. The narration is
+   the primary voice; each tool call sits just under the line it followed as a
+   quiet action row; one footer ends the whole turn. No micro-message stutter. */
+.turn-agent { display: flex; gap: 0.8rem; margin: 0 0 1.8rem; }
+.turn-avatar {
+  flex-shrink: 0; width: 28px; height: 28px; margin-top: 0.15rem;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 8px; background: var(--raised); border: 1px solid var(--line);
+}
+.turn-avatar .logo-mark { width: 16px; height: 16px; color: var(--accent); }
+.turn-agent.active .turn-avatar .logo-mark { animation: pulse 2s ease-in-out infinite; }
+.turn-body { flex: 1; min-width: 0; }
+
+/* narration paragraphs flow; one rhythm between them and the actions */
+.turn-body .md-turn { margin: 0; }
+.turn-body .md-turn + .md-turn { margin-top: 0.7rem; }
+.act-line + .md-turn { margin-top: 0.7rem; }
+.turn-body .streaming::after {
+  content: "▋"; margin-left: 0.1rem; color: var(--accent);
+  animation: cursor-blink 1s step-end infinite;
+}
+
+/* a tool call — quiet, verb + target, just under the narration it followed */
+.act-line {
+  display: flex; gap: 0.5rem; align-items: baseline;
+  margin: 0.18rem 0 0.5rem; padding-left: 0.1rem;
+  font-family: var(--mono); font-size: 0.78rem;
+}
+.act-line .act-k { flex-shrink: 0; color: var(--muted); }
+.act-line .act-v { color: var(--faint); word-break: break-all; }
+
+/* Thinking — a single faint, ignorable toggle */
+.turn-body .think { margin: 0 0 0.5rem; }
+.turn-body .think > summary {
+  list-style: none; cursor: pointer; user-select: none;
+  font-family: var(--mono); font-size: 0.73rem; color: var(--line-2);
+  transition: color .15s ease;
+}
+.turn-body .think > summary::-webkit-details-marker { display: none; }
+.turn-body .think > summary::before { content: "› "; }
+.turn-body .think > summary:hover { color: var(--faint); }
+.turn-body .think-body {
+  margin: 0.35rem 0 0.2rem 0.5rem; padding-left: 0.75rem; border-left: 1px solid var(--line);
+  color: var(--muted); font-size: 0.86rem; line-height: 1.6;
+}
+
+/* one footer for the whole turn: result + elapsed + time */
+.turn-foot {
+  display: flex; align-items: center; gap: 0.5rem; margin-top: 0.85rem;
+  font-family: var(--mono); font-size: 0.72rem; color: var(--faint); letter-spacing: 0.02em;
+}
+.turn-foot .foot-dot { flex-shrink: 0; width: 5px; height: 5px; border-radius: 50%; background: var(--faint); }
+.turn-foot-ok .foot-dot { background: var(--ok); }      .turn-foot-ok .foot-label { color: var(--ok); }
+.turn-foot-warn .foot-dot { background: var(--warn); }  .turn-foot-warn .foot-label { color: var(--warn); }
+.turn-foot-danger .foot-dot { background: var(--bad); } .turn-foot-danger .foot-label { color: var(--bad); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.4; transform: scale(1); }
+  50%      { opacity: 1;   transform: scale(1.18); }
+}
+
+/* ============================================================ Markdown */
+.md > :first-child { margin-top: 0; }
+.md > :last-child  { margin-bottom: 0; }
+.md p { margin: 0.6rem 0; }
+.md h1, .md h2, .md h3, .md h4 {
+  margin: 1.2rem 0 0.5rem; line-height: 1.3; font-weight: 600; letter-spacing: -0.01em; color: var(--ink);
+}
+.md h1 { font-size: 1.3rem; }
+.md h2 { font-size: 1.12rem; }
+.md h3 { font-size: 1rem; }
+.md ul, .md ol { margin: 0.5rem 0 0.75rem; padding-left: 1.4rem; }
+.md li { margin: 0.3rem 0; }
+.md a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--accent-ring); word-break: break-all; }
+.md a:hover { border-bottom-color: var(--accent); }
+.md code {
+  font-family: var(--mono); font-size: 0.85em;
+  background: var(--inset); border: 1px solid var(--line);
+  padding: 0.08rem 0.36rem; border-radius: var(--r-xs); word-break: break-all;
+}
+.md pre {
+  margin: 0.7rem 0; padding: 0.85rem 1rem; overflow-x: auto;
+  background: var(--inset); border: 1px solid var(--line); border-radius: var(--r-sm);
+  font-size: 0.83rem; line-height: 1.55;
+}
+.md pre code { background: none; border: 0; padding: 0; font-size: inherit; }
+.md table {
+  margin: 0.7rem 0; border-collapse: collapse; font-size: 0.88rem;
+  border: 1px solid var(--line); border-radius: var(--r-sm); overflow: hidden;
+}
+.md th, .md td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid var(--line); }
+.md tr:last-child td { border-bottom: 0; }
+.md th { background: var(--raised); font-weight: 600; color: var(--ink); }
+.md blockquote { margin: 0.7rem 0; padding: 0.3rem 0 0.3rem 1rem; border-left: 2px solid var(--accent); color: var(--muted); }
+.md hr { border: 0; border-top: 1px solid var(--line); margin: 1.2rem 0; }
+.md strong { color: var(--ink); font-weight: 600; }
+
+.stopping-note {
+  margin-bottom: 0.6rem; padding: 0.55rem 0.75rem; border-radius: var(--r-sm);
+  font-size: 0.82rem; color: var(--warn);
+  background: rgba(224, 168, 90, 0.08); border: 1px solid rgba(224, 168, 90, 0.25);
+}
+
+/* ============================================================ Plan card */
+.plan-card {
+  margin: 0 0 1.4rem; padding: 1rem 1.1rem; max-width: 64ch;
+  background: var(--raised); border: 1px solid var(--accent-ring); border-radius: var(--r);
+}
+.plan-card-header {
+  margin-bottom: 0.6rem;
+  font-family: var(--mono); font-size: 0.68rem; font-weight: 600;
+  letter-spacing: 0.18em; text-transform: uppercase; color: var(--accent);
+}
+.plan-card-body { font-size: 0.92rem; line-height: 1.5; }
+.plan-card-body h1, .plan-card-body h2, .plan-card-body h3 { font-size: 0.95rem; margin: 0.8rem 0 0.4rem; }
+.plan-card-body ul, .plan-card-body ol { padding-left: 1.2rem; margin: 0.3rem 0; }
+.plan-card-body li { margin: 0.18rem 0; }
+.plan-card-body p { margin: 0.4rem 0; }
+.plan-note-wrap { margin: 0.6rem 0 0; }
+.plan-note {
+  width: 100%; box-sizing: border-box; resize: vertical;
+  padding: 0.5rem 0.6rem; border-radius: var(--r-xs);
+  background: var(--inset); color: var(--ink); border: 1px solid var(--line);
+  font-family: var(--sans); font-size: 0.85rem; line-height: 1.4;
+}
+.plan-actions { margin-top: 0.8rem; display: flex; gap: 0.5rem; }
+.plan-btn {
+  padding: 0.4rem 0.85rem; border-radius: var(--r-xs);
+  background: var(--inset); border: 1px solid var(--line-2); color: var(--ink); font-size: 0.85rem;
+}
+.plan-btn:hover:not(:disabled) { border-color: var(--faint); }
+.plan-btn:disabled { opacity: 0.5; cursor: default; }
+.plan-approve { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.plan-approve:hover:not(:disabled) { background: var(--accent-2); }
+
+/* ============================================================ Preview */
+#preview-block { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 0.6rem; overflow: hidden; }
+.preview-header { flex: 0 0 auto; display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap; padding-bottom: 0.5rem; }
+.preview-version { font-family: var(--mono); font-size: 0.76rem; color: var(--faint); }
+.preview-actions { margin-left: auto; display: flex; align-items: center; gap: 0.85rem; }
+.preview-actions a {
+  display: inline-flex; align-items: center; gap: 0.2rem;
+  font-size: 0.82rem; color: var(--muted); text-decoration: none;
+  border-bottom: 1px solid transparent; transition: color .15s ease, border-color .15s ease;
+}
+.preview-actions a::after { content: "↗"; font-size: 0.85em; }
+.preview-actions a:hover { color: var(--accent); border-bottom-color: var(--accent-ring); }
+.preview-actions button {
+  padding: 0.3rem 0.5rem; border-radius: var(--r-xs);
+  border: 1px solid var(--line-2); color: var(--faint); font-size: 0.82rem; line-height: 1;
+}
+.preview-actions button:hover:not(:disabled) { color: var(--ink); border-color: var(--faint); }
+#preview-iframe {
+  flex: 1 1 auto; width: 100%; min-height: 0;
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: #fff;
+}
+body.preview-expanded #preview-iframe { min-height: 80vh; }
+
+/* ============================================================ Footer / input */
+#chat-footer {
+  display: flex; flex-direction: column; gap: 0.6rem; padding: 1rem 1.4rem; flex-shrink: 0;
+  border-top: 1px solid var(--line); background: var(--paper);
+}
+.footer-row { display: flex; gap: 0.7rem; }
+.footer-attach {
+  align-self: stretch; flex-shrink: 0; padding: 0 0.85rem;
+  font-family: var(--mono); font-size: 1.05rem; line-height: 1;
+}
+.upload-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.upload-chips[hidden] { display: none; }
+.upload-chip {
+  display: inline-flex; align-items: center; max-width: 16rem;
+  padding: 0.2rem 0.6rem; border-radius: 999px;
+  background: var(--accent-soft); border: 1px solid var(--accent-ring); color: var(--accent-2);
+  font-family: var(--mono); font-size: 0.72rem;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#input {
+  flex: 1; padding: 0.7rem 1rem; resize: vertical; min-height: 2.6rem; line-height: 1.55;
+  background: var(--inset); color: var(--ink); border: 1px solid var(--line); border-radius: var(--r);
+  font-family: var(--sans); font-size: 0.95rem;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+#input::placeholder { color: var(--faint); }
+#input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-ring); }
+#btn-send {
+  align-self: stretch; padding: 0 1.2rem; border-radius: var(--r);
+  background: var(--accent); color: var(--accent-ink); font-weight: 600; font-size: 0.88rem;
+  transition: background .15s ease, transform .08s ease;
+}
+#btn-send:hover:not(:disabled) { background: var(--accent-2); }
+#btn-send:active:not(:disabled) { transform: translateY(1px); }
+#btn-send:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ============================================================ Scrollbar */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: var(--faint); }
+
+/* ============================================================ Responsive */
+@media (max-width: 720px) {
+  #chat-main { grid-template-columns: 1fr; }
+  body.has-preview #chat-main { grid-template-columns: 1fr; }
+  body.has-preview #side { border-left: 0; border-top: 1px solid var(--line); }
+  #messages { padding: 1.4rem 1.1rem; }
+  .portal-card { padding: 2rem 1.5rem 1.7rem; }
+}
+
+@media (max-width: 560px) {
+  /* tight screens: the logo carries the brand, status truncates — free all the
+     room the actions need so 停止 / 终止 are never pushed off. */
+  #chat-header { gap: 0.6rem; padding: 0.8rem 1rem; }
+  .header-wordmark, .session-id { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .turn-agent.active .turn-avatar .logo-mark { animation: none; }
+  .turn-body .streaming::after { animation: none; }
+  * { transition: none !important; }
+}

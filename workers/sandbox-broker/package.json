@@ -1,0 +1,15 @@
+{
+  "name": "@wdl-chat/sandbox-broker",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dry-run": "wrangler deploy --dry-run --outdir=.deploy-dist"
+  },
+  "dependencies": {
+    "@wdl-dev/aws-sigv4": "^1.1.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

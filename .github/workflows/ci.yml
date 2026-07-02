@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - run: npm ci
+      # The unit suite runs fully offline (mocked dependencies); the e2e suite
+      # (npm run test:e2e) drives the live deployment and is not run in CI.
+      - run: npm run check
+      - run: npm test

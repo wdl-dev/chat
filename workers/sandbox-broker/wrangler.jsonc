@@ -1,0 +1,27 @@
+{
+  // The MicroVM lifecycle broker. Deploys as a user-runtime worker in the
+  // `demo` ns (same tier as chat-worker — it needs only public outbound and
+  // holds its AWS key as a per-worker secret). RPC-only: no public route.
+  "name": "sandbox-broker",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-05-31",
+
+  // JSRPC service binding only — chat-worker (ns demo) calls the Broker
+  // entrypoint. No route, no shared token; the binding is the capability.
+  "exports": [
+    {
+      "entrypoint": "Broker",
+      "allowed_callers": ["demo"]
+    }
+  ],
+
+  // Secrets via `wdl secret put --worker sandbox-broker --ns demo`:
+  //   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  - the broker IAM user
+  //   MICROVM_IMAGE_ARN  - arn:aws:lambda:<region>:<account>:microvm-image:wdl-chat-sandbox
+  //                        (a secret, not a var, so the account id isn't committed)
+  "vars": {
+    "AWS_REGION": "ap-northeast-1",
+    "INGRESS_CONNECTOR_ARN": "arn:aws:lambda:ap-northeast-1:aws:network-connector:aws-network-connector:ALL_INGRESS",
+    "EGRESS_CONNECTOR_ARN": "arn:aws:lambda:ap-northeast-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
+  }
+}

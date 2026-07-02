@@ -1,0 +1,24 @@
+{
+  // Deploys to ns=demo (worker name "chat"). Serves the SPA at / and proxies
+  // /api/* to chat-worker via the CHAT service binding below.
+  "name": "chat",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-05-31",
+
+  // chat.wdl.dev must be a declared custom host for the demo ns (declare it
+  // via POST /ns/demo/hosts). The trailing /* makes wdl-cli emit a pattern
+  // route; promote writes patterns:chat.wdl.dev -> this worker. Path is not
+  // stripped on the pattern branch, so the SPA serves from chat.wdl.dev/.
+  "routes": [
+    "chat.wdl.dev/*"
+  ],
+
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+
+  "services": [
+    { "binding": "CHAT", "service": "chat-worker" }
+  ]
+}
