@@ -38,7 +38,9 @@ tests/e2e/            联机 e2e(单测在各 worker 旁边)
 的 AWS key 起一台 MicroVM、铸一个短期 JWE、把 session 信息推给 VM 里的 sandbox-agent
 `/init`，然后把 `{ endpoint, authToken }` 交回 chat-worker。chat-worker 之后直连
 MicroVM 的公网 HTTPS endpoint（带 `X-aws-proxy-auth`）跑命令 / 部署。Close 时
-`broker.closeSession` terminate 掉 VM。无长驻池、无 lease、无 mesh。
+`broker.closeSession` terminate 掉 VM。session 另有 6 小时硬生命周期（ns token TTL）：
+超时后 router 在下次请求时惰性终止（写路径 `410`，stream/export `404`），VM 自身的
+6h max-lifetime 兜底回收。无长驻池、无 lease、无 mesh。
 
 ## 部署链路
 

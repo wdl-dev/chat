@@ -23,12 +23,14 @@ export function timingSafeStringEqual(a, b) {
 }
 
 // Must reject empty expected first: timingSafeStringEqual("","") is true.
-export function requireSecretEqual(presented, expected, name, authMsg) {
+export function requireSecretEqual(presented, expected, name, subject) {
   if (typeof expected !== "string" || expected.length === 0) {
     throw httpError(503, `${name} not configured`);
   }
-  if (!timingSafeStringEqual(presented ?? "", expected)) {
-    throw httpError(401, authMsg);
+  const given = presented ?? "";
+  if (given.length === 0) throw httpError(401, `${subject} required`);
+  if (!timingSafeStringEqual(given, expected)) {
+    throw httpError(401, `${subject} incorrect`);
   }
 }
 

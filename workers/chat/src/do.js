@@ -104,7 +104,7 @@ export class ChatSessionDO extends DurableObject {
     state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
-  // reason ∈ {"user_stop","user_close","user_supersede","llm_timeout"}
+  // reason ∈ {"user_stop","user_close","user_supersede","llm_timeout","expired"}
   _cancelRun(runId, reason) {
     this.sql.exec(
       "UPDATE runs SET cancel_requested = 1, cancel_reason = ? WHERE run_id = ?",
@@ -145,13 +145,14 @@ export class ChatSessionDO extends DurableObject {
     return row?.run_id ?? null;
   }
 
-  async init({ sessionId, ns, nsToken, lang }) {
+  async init({ sessionId, ns, nsToken, expiresAt, lang }) {
     if (typeof sessionId !== "string" || !sessionId) throw httpError(400, "sessionId required");
     if (typeof ns !== "string" || !ns) throw httpError(400, "ns required");
     if (typeof nsToken !== "string" || !nsToken) throw httpError(400, "nsToken required");
     this._writeMeta("sessionId", sessionId);
     this._writeMeta("ns", ns);
     this._writeMeta("nsToken", nsToken);
+    if (Number.isFinite(expiresAt)) this._writeMeta("expiresAt", String(expiresAt));
     this._writeMeta("lang", lang === "zh" ? "zh" : "en");
     return { ok: true };
   }
@@ -252,10 +253,18 @@ export class ChatSessionDO extends DurableObject {
   }
 
   async requestClose() {
+    return this._closeSession("user_close");
+  }
+
+  async expire() {
+    return this._closeSession("expired");
+  }
+
+  async _closeSession(reason) {
     this._writeMeta("closed", "1");
     const activeRunId = this._latestActiveRunId();
     if (activeRunId) {
-      this._cancelRun(activeRunId, "user_close");
+      this._cancelRun(activeRunId, reason);
       await this._terminateWorkflow(activeRunId);
       // terminate() skips _endRun, so settle here or the row stays pending forever.
       this._endRun(activeRunId, "aborted");
@@ -272,7 +281,7 @@ export class ChatSessionDO extends DurableObject {
         this._writeMeta("microvmAuthToken", "");
       }
     }
-    this._broadcast("session.closed", {});
+    this._broadcast("session.closed", { reason });
     for (const ctl of this.subscribers) {
       try { ctl.close(); } catch { /* peer gone */ }
     }
@@ -836,11 +845,25 @@ export class ChatSessionDO extends DurableObject {
     return true;
   }
 
+  _expiredNow() {
+    const exp = Number(this._readMeta("expiresAt"));
+    return Number.isFinite(exp) && exp > 0 && Date.now() >= exp;
+  }
+
+  // Deadline crossing only cancels the run — full teardown (VM, catalog) stays with the router's
+  // expireSession on next access, and the broker's 6h max lifetime backstops the VM.
+  _cancelIfExpired(runId) {
+    if (!this._expiredNow()) return false;
+    this._cancelRun(runId, "expired");
+    return true;
+  }
+
   _isCancelled(runId) {
     const row = firstRow(this.sql.exec(
       "SELECT cancel_requested FROM runs WHERE run_id = ?", runId,
     ));
-    return Boolean(row?.cancel_requested);
+    if (row?.cancel_requested) return true;
+    return this._cancelIfExpired(runId);
   }
 
   _sanitizeLlmResponse(resp) {
@@ -1050,7 +1073,13 @@ export class ChatSessionDO extends DurableObject {
         { seq: row.seq, role: row.role, content, createdAt: row.created_at, replay: true },
       );
     }
-    emit("history.done", { replayed: recent.length, lang: this._lang(), ns: this._readMeta("ns") });
+    emit("history.done", {
+      replayed: recent.length,
+      lang: this._lang(),
+      ns: this._readMeta("ns"),
+      // lets a client without the localStorage copy (cross-device hash resume) learn the countdown deadline
+      expiresAt: Number(this._readMeta("expiresAt")) || null,
+    });
     // Use the NEWEST run by start time (a superseded 'running' run can linger after a newer one finished).
     const newest = firstRow(this.sql.exec(
       "SELECT run_id, status, error, cancel_reason, stop_reason FROM runs ORDER BY started_at DESC, rowid DESC LIMIT 1",

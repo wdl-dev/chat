@@ -65,7 +65,7 @@ async function realWithin(p, root) {
 // mkdir -p, fully confined: each component is created and reopened through the PARENT's pinned dir fd
 // (/proc/self/fd/<fd>) with O_NOFOLLOW. Every op targets a pinned inode, so a concurrently-swapped
 // path component can neither redirect the root mkdir outside the workspace nor be followed as a symlink.
-async function mkdirWithinConfined(targetDir, root) {
+async function mkdirWithinConfined(targetDir, root, ownerUid = null, leafMode = null) {
   const rel = path.relative(root, targetDir);
   if (rel === "") return;
   if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) throw httpErr(400, "path escapes workspace");
@@ -76,9 +76,11 @@ async function mkdirWithinConfined(targetDir, root) {
       const at = `/proc/self/fd/${dirFd.fd}/${part}`;
       try { await fs.mkdir(at); } catch (e) { if (e?.code !== "EEXIST") throw e; }
       const childFd = await fs.open(at, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW); // O_NOFOLLOW: part must be a real dir, not a symlink
+      if (ownerUid != null) await childFd.chown(ownerUid, ownerUid); // fchown the pinned inode — never a re-walked pathname
       await dirFd.close();
       dirFd = childFd;
     }
+    if (leafMode != null) await dirFd.chmod(leafMode); // fchmod the leaf only (not the shared parents)
   } finally {
     await dirFd.close();
   }
@@ -105,12 +107,12 @@ function spawnAndCollect(args, { timeoutMs } = {}) {
   });
 }
 
+// /init is re-POSTable and the agent's :8080 is reachable from the sandbox uid (proxy bypassed), so a
+// racing dir→symlink swap is possible — go through the pinned-fd walk, never pathname mkdir/chmod/chown.
 async function ensureSessionDirs(sessionId) {
   const { uid } = SANDBOX_USER;
   for (const dir of [sessionDir(sessionId), sessionHomeDir(sessionId)]) {
-    await fs.mkdir(dir, { recursive: true });
-    await fs.chmod(dir, 0o700);
-    await fs.chown(dir, uid, uid);
+    await mkdirWithinConfined(dir, WORKSPACE, uid, 0o700);
   }
 }
 
@@ -204,7 +206,8 @@ async function handleWriteFile(body) {
   if (typeof body?.content !== "string") throw httpErr(400, "content must be a string");
   const base64 = body?.encoding === "base64";
   const buf = base64 ? Buffer.from(body.content, "base64") : Buffer.from(body.content, "utf8");
-  await mkdirWithinConfined(path.dirname(abs), sdir);
+  const ownershipWarnings = [];
+  await mkdirWithinConfined(path.dirname(abs), sdir, uid);
   const realDir = await realWithin(path.dirname(abs), sdir);
   const target = path.join(realDir, path.basename(abs));
   // TOCTOU guard: O_NOFOLLOW (leaf) + O_EXCL + fd-realpath re-check inside the session dir; unlink a file a redirected open created outside the workspace.
@@ -226,27 +229,13 @@ async function handleWriteFile(body) {
     }
     await fh.truncate(0);
     await fh.write(buf, 0, buf.length, 0);
-  } finally { await fh.close(); }
-  // lchown/lstat (never chown/stat) so ownership never traverses a symlink.
-  const ownershipWarnings = [];
-  try {
-    await fs.lchown(target, uid, uid);
-  } catch (err) {
-    ownershipWarnings.push(`lchown ${target}: ${err?.message ?? err}`);
-  }
-  let dir = realDir;
-  while (dir.startsWith(sdir) && dir !== sdir) {
-    const stat = await fs.lstat(dir).catch(() => null);
-    if (!stat) break;
-    if (stat.uid !== uid) {
-      try {
-        await fs.lchown(dir, uid, uid);
-      } catch (err) {
-        ownershipWarnings.push(`lchown ${dir}: ${err?.message ?? err}`);
-      }
+    // fchown the verified fd — a post-check pathname swap can't redirect it, unlike lchown on target.
+    try {
+      await fh.chown(uid, uid);
+    } catch (err) {
+      ownershipWarnings.push(`fchown ${target}: ${err?.message ?? err}`);
     }
-    dir = path.dirname(dir);
-  }
+  } finally { await fh.close(); }
   const result = { ok: true, path: presented, bytes: buf.length };
   if (ownershipWarnings.length > 0) {
     console.warn(`/write-file ${target}: chown failures`, ownershipWarnings);

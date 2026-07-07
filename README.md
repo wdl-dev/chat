@@ -60,8 +60,10 @@ service binding: the broker uses its AWS key to launch a MicroVM, mint a
 short-lived JWE, push the session context to the in-VM sandbox-agent's `/init`,
 and hand `{ endpoint, authToken }` back. chat-worker then talks to the MicroVM's
 public HTTPS endpoint directly (with `X-aws-proxy-auth`) to run commands and
-deploy. On close, `broker.closeSession` terminates the VM. No standing pool, no
-leases, no mesh.
+deploy. On close, `broker.closeSession` terminates the VM. Sessions also have a
+hard 6-hour lifetime (the ns-token TTL): past it the router lazily expires the
+session on the next request (gated writes get `410`, stream/export `404`) and the
+VM's own 6h max-lifetime reaps it. No standing pool, no leases, no mesh.
 
 ## Deploy
 

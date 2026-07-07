@@ -63,10 +63,14 @@ test("requireSecretEqual 503s when expected is missing or empty", () => {
   }
 });
 
-test("requireSecretEqual 401s on mismatch when expected is configured", () => {
+test("requireSecretEqual 401s 'incorrect' on mismatch, 'required' on empty presented", () => {
   assert.throws(
-    () => requireSecretEqual("wrong", "right", "MY_SECRET", "wrong token"),
-    (err) => err.status === 401 && err.message === "wrong token",
+    () => requireSecretEqual("wrong", "right", "MY_SECRET", "token"),
+    (err) => err.status === 401 && err.message === "token incorrect",
+  );
+  assert.throws(
+    () => requireSecretEqual("", "right", "MY_SECRET", "token"),
+    (err) => err.status === 401 && err.message === "token required",
   );
 });
 

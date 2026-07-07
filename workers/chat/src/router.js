@@ -6,6 +6,9 @@ import {
 } from "./lib.js";
 
 const DELEGATED_TEMPLATE = "wdl-chat-ns-pool";
+// The wdl-chat-ns-pool template's server-side TTL.
+const DELEGATED_TTL_MS = 6 * 60 * 60_000;
+const NS_TOKEN_EXPIRY_MARGIN_MS = 5 * 60_000;
 
 const MAX_JSON_BODY_BYTES = 256 * 1024; // bounds JSON body parse cost (>> the 50KB message cap)
 const MAX_USER_MESSAGE_BYTES = 50_000;
@@ -49,15 +52,42 @@ async function mintDelegatedNs(env, fetcher) {
 
 async function lookupSessionIndex(env, sessionId) {
   const row = await env.CHAT_DB.prepare(
-    `SELECT id, ns, status FROM sessions_index WHERE id = ?1`
+    `SELECT id, ns, status, created_at FROM sessions_index WHERE id = ?1`
   ).bind(sessionId).first();
   return row ?? null;
 }
 
-// The common gate: the session must exist and be active, or 404. Returns the row.
+function sessionDeadline(idx) {
+  const created = Number(idx?.created_at);
+  return Number.isFinite(created) ? created + DELEGATED_TTL_MS - NS_TOKEN_EXPIRY_MARGIN_MS : null;
+}
+
+function sessionExpired(idx) {
+  const deadline = sessionDeadline(idx);
+  return deadline !== null && Date.now() >= deadline;
+}
+
+// Lazy termination: a stale session is torn down on next access, not by a background reaper.
+async function expireSession(env, sessionId) {
+  const stub = getDoStub(env, sessionId);
+  try {
+    await stub.expire();
+  } catch (err) {
+    // DO facets pinned to a pre-expire() worker version still have requestClose (same teardown, generic reason).
+    try { await stub.requestClose(); }
+    catch (err2) { console.warn(`expire teardown failed for ${sessionId}: ${errMessage(err)}; fallback: ${errMessage(err2)}`); }
+  }
+  await markSessionClosed(env, sessionId);
+}
+
+// The common gate: the session must exist and be active, or 404 (410 if it just expired). Returns the row.
 async function requireActiveSession(env, sessionId) {
   const idx = await lookupSessionIndex(env, sessionId);
   if (!idx || idx.status !== "active") throw httpError(404, "session not active");
+  if (sessionExpired(idx)) {
+    await expireSession(env, sessionId);
+    throw httpError(410, "session expired");
+  }
   return idx;
 }
 
@@ -69,7 +99,7 @@ async function markSessionClosed(env, sessionId) {
 
 function passcodeGate(env, body) {
   const presented = (body && typeof body.passcode === "string") ? body.passcode : "";
-  requireSecretEqual(presented, env.DEMO_PASSCODE, "DEMO_PASSCODE", "passcode required");
+  requireSecretEqual(presented, env.DEMO_PASSCODE, "DEMO_PASSCODE", "passcode");
 }
 
 async function handleStartSession(env, body, fetcher) {
@@ -82,14 +112,15 @@ async function handleStartSession(env, body, fetcher) {
     `INSERT INTO sessions_index (id, ns, ns_token_id, created_at, last_active_at, status)
      VALUES (?1, ?2, ?3, ?4, ?4, 'active')`
   ).bind(sessionId, ns, tokenId ?? null, now).run();
+  const expiresAt = sessionDeadline({ created_at: now });
   try {
-    await getDoStub(env, sessionId).init({ sessionId, ns, nsToken, lang });
+    await getDoStub(env, sessionId).init({ sessionId, ns, nsToken, expiresAt, lang });
   } catch (err) {
     await markSessionClosed(env, sessionId);
     console.warn(`session init failed: ${errMessage(err)}`);
     throw httpError(502, "session init failed");
   }
-  return jsonResponse(200, { sessionId, ns });
+  return jsonResponse(200, { sessionId, ns, expiresAt });
 }
 
 async function handlePostMessage(env, sessionId, body) {
@@ -156,7 +187,11 @@ async function handleClose(env, sessionId) {
 async function proxyGetToDo(req, env, sessionId, path) {
   const idx = await lookupSessionIndex(env, sessionId);
   if (!idx) throw httpError(404, "session not found");
-  if (idx.status === "closed") throw httpError(404, "session closed");
+  if (idx.status !== "active") throw httpError(404, "session closed");
+  if (sessionExpired(idx)) {
+    await expireSession(env, sessionId);
+    throw httpError(404, "session closed");
+  }
   return await getDoStub(env, sessionId).fetch(
     new Request(`https://do/${path}`, { method: "GET", headers: req.headers }),
   );
@@ -173,7 +208,7 @@ async function handleUpload(req, env, sessionId) {
 
 function operatorGate(req, env) {
   const presented = req.headers.get("x-operator-token") ?? "";
-  requireSecretEqual(presented, env.OPERATOR_TOKEN, "OPERATOR_TOKEN", "operator token required");
+  requireSecretEqual(presented, env.OPERATOR_TOKEN, "OPERATOR_TOKEN", "operator token");
 }
 
 async function handleAdminForceClose(req, env, sessionId) {

@@ -4,9 +4,11 @@ const API_VERSION = "2025-09-09";
 const AUTH_TOKEN_MINUTES = 30;
 const RUNNING_POLL_MS = 1000;
 const RUNNING_POLL_MAX = 40;
+// Aligned to the 6h ns-token TTL so the VM outlives every valid token.
 const IDLE_SUSPEND_SECONDS = 10 * 60;
-const SUSPENDED_TERMINATE_SECONDS = 30 * 60;
-const MAX_LIFETIME_SECONDS = 2 * 60 * 60;
+const MAX_LIFETIME_SECONDS = 6 * 60 * 60;
+// Equal to the lifetime cap => a suspended VM is never idle-terminated early.
+const SUSPENDED_TERMINATE_SECONDS = MAX_LIFETIME_SECONDS;
 
 export const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

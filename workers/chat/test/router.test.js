@@ -4,13 +4,14 @@ import { handleRequest } from "../src/router.js";
 
 // Minimal env: a D1 stub returning a fixed sessions_index row, a DO stub, and
 // a workflow stub. Override sessionRow / do per test.
-function makeEnv({ sessionRow = { id: "s1", ns: "s1", status: "active" }, do: doOver = {}, runExists = true, runAttempt = "0" } = {}) {
+function makeEnv({ sessionRow = { id: "s1", ns: "s1", status: "active", created_at: Date.now() }, do: doOver = {}, runExists = true, runAttempt = "0" } = {}) {
   const doStub = {
     init: async () => ({ ok: true }),
     addUserMessage: async () => ({ runId: "r1", seq: 1, mode: "free_form" }),
     cancelLatestRun: async () => ({ ok: true, runId: "r1" }),
     runBelongsToSession: async () => ({ exists: runExists, attempt: runAttempt }),
     requestClose: async () => {},
+    expire: async () => ({ ok: true }),
     fetch: async () => new Response("ok", { status: 200 }),
     ...doOver,
   };
@@ -46,6 +47,12 @@ test("unknown route -> 404 not found", async () => {
 
 test("portal/start rejects a wrong passcode with 401 (before minting anything)", async () => {
   const res = await handleRequest(req("POST", "/portal/start", { json: { passcode: "wrong" } }), makeEnv());
+  assert.equal(res.status, 401);
+  assert.equal((await body(res)).error, "passcode incorrect");
+});
+
+test("portal/start 401s 'passcode required' when none is presented", async () => {
+  const res = await handleRequest(req("POST", "/portal/start", { json: {} }), makeEnv());
   assert.equal(res.status, 401);
   assert.equal((await body(res)).error, "passcode required");
 });
@@ -147,6 +154,61 @@ test("POST /cancel cancels the latest run", async () => {
   assert.deepEqual(await body(res), { ok: true, runId: "r1" });
 });
 
+// One D1 mock for the lazy-expiry tests; createdAt drives the time gate, flags record the teardown.
+function dbEnv({ createdAt, do: doOver = {} } = {}) {
+  const flags = { expired: false, closed: false, closedInDb: false };
+  const env = makeEnv({ do: {
+    expire: async () => { flags.expired = true; return { ok: true }; },
+    requestClose: async () => { flags.closed = true; return { ok: true }; },
+    ...doOver,
+  } });
+  env.CHAT_DB = { prepare: (sql) => ({ bind: () => ({
+    first: async () => ({ id: "s1", ns: "s1", status: "active", created_at: createdAt }),
+    run: async () => { if (/status = 'closed'/.test(sql)) flags.closedInDb = true; return {}; },
+  }) }) };
+  return { env, flags };
+}
+
+test("POST messages on an expired session lazily terminates it (410 + catalog closed + DO expire)", async () => {
+  const { env, flags } = dbEnv({ createdAt: 0 });
+  const res = await handleRequest(req("POST", "/sessions/s1/messages", { json: { content: "hi" } }), env);
+  assert.equal(res.status, 410);
+  assert.equal((await body(res)).error, "session expired");
+  assert.ok(flags.expired, "DO expire() called");
+  assert.ok(flags.closedInDb, "sessions_index marked closed");
+});
+
+test("GET stream on an expired session tears it down and 404s (never forwards to the DO)", async () => {
+  const { env, flags } = dbEnv({ createdAt: 0, do: { fetch: async () => new Response("should-not-reach", { status: 200 }) } });
+  const res = await handleRequest(req("GET", "/sessions/s1/stream"), env);
+  assert.equal(res.status, 404);
+  assert.equal((await body(res)).error, "session closed");
+  assert.ok(flags.expired, "DO expire() called on stream access");
+  assert.ok(flags.closedInDb, "sessions_index marked closed");
+});
+
+test("a fresh (non-expired) active session is not torn down", async () => {
+  const { env, flags } = dbEnv({ createdAt: Date.now() });
+  const res = await handleRequest(req("POST", "/sessions/s1/messages", { json: { content: "hi" } }), env);
+  assert.equal(res.status, 202);
+  assert.ok(!flags.expired, "fresh session must not be expired");
+});
+
+test("a legacy row without created_at never trips the time gate", async () => {
+  const { env, flags } = dbEnv({ createdAt: undefined });
+  const res = await handleRequest(req("POST", "/sessions/s1/messages", { json: { content: "hi" } }), env);
+  assert.equal(res.status, 202);
+  assert.ok(!flags.expired);
+});
+
+test("expiry still fences the catalog when DO expire() is missing, via the requestClose fallback", async () => {
+  const { env, flags } = dbEnv({ createdAt: 0, do: { expire: async () => { throw new Error("no such method"); } } });
+  const res = await handleRequest(req("POST", "/sessions/s1/messages", { json: { content: "hi" } }), env);
+  assert.equal(res.status, 410);
+  assert.ok(flags.closed, "fell back to requestClose()");
+  assert.ok(flags.closedInDb, "catalog fenced even though expire() threw");
+});
+
 test("POST /upload rejects an oversized body via content-length", async () => {
   const res = await handleRequest(req("POST", "/sessions/s1/upload", { headers: { "content-length": String(20 * 1024 * 1024) } }), makeEnv());
   assert.equal(res.status, 413);
@@ -172,12 +234,25 @@ test("approve-plan forwards the plan_approval event on the happy path", async ()
 });
 
 test("portal/start mints a session with a random id decoupled from the public ns", async () => {
+  const before = Date.now();
   const res = await handleRequest(req("POST", "/portal/start", { json: { passcode: "pass-123", lang: "zh" } }), makeEnv(), fakeMint());
   assert.equal(res.status, 200);
   const out = await body(res);
   assert.equal(out.ns, "tmp-xyz");
   assert.match(out.sessionId, /^[0-9a-f-]{36}$/);
   assert.notEqual(out.sessionId, out.ns);  // bearer id must not equal the published ns
+  // expiresAt = the moment the lazy-expiry gate starts refusing (TTL minus margin), for the client countdown
+  const sixHoursLessMargin = 6 * 60 * 60_000 - 5 * 60_000;
+  assert.ok(out.expiresAt >= before + sixHoursLessMargin && out.expiresAt <= Date.now() + sixHoursLessMargin);
+});
+
+test("portal/start hands the DO the same expiresAt it returns to the client", async () => {
+  let got = null;
+  const env = makeEnv({ do: { init: async (a) => { got = a; return { ok: true }; } } });
+  const res = await handleRequest(req("POST", "/portal/start", { json: { passcode: "pass-123" } }), env, fakeMint());
+  const out = await body(res);
+  assert.ok(Number.isFinite(got.expiresAt));
+  assert.equal(got.expiresAt, out.expiresAt);
 });
 
 test("portal/start rolls back the session index when DO init fails", async () => {

@@ -15,6 +15,7 @@ const previewVersion = $("#preview-version");
 const previewExpandBtn = $("#preview-expand");
 const sessionIdEl = $("#session-id");
 const statusEl = $("#status");
+const countdownEl = $("#countdown");
 const inputEl = $("#input");
 const sendBtn = $("#btn-send");
 const stopBtn = $("#btn-stop");
@@ -26,6 +27,7 @@ const uploadChips = $("#upload-chips");
 const portalLangEl = $("#portal-lang");
 
 const STORAGE_KEY = "wdl-chat-session-id";
+const EXPIRES_KEY = "wdl-chat-session-expires";
 const LANG_KEY = "wdl-chat-lang";
 const LANG_PREF_KEY = "wdl-chat-lang-pref";
 
@@ -40,6 +42,8 @@ const STRINGS = {
     "portal.errDefault": "Failed to start",
     "portal.errPasscode": "passcode incorrect",
     "portal.errBusy": "All sandboxes are busy, try again later.",
+    "portal.expired": "Your previous session reached the 6-hour limit and has ended.",
+    "countdown.tooltip": "Sessions end 6 hours after start — export your code before the timer runs out.",
     "session.starting": "Starting…",
     "btn.stop": "Stop",
     "btn.close": "End",
@@ -64,6 +68,7 @@ const STRINGS = {
     "status.ready": "Ready",
     "status.disconnected": "Disconnected — refresh to reconnect",
     "status.closed": "Session ended",
+    "status.expired": "Session expired — start a new one",
     "status.closeFailed": "Couldn't end the session — try again.",
     "status.historyReplayed": (n) => `Replayed ${n} message${n === 1 ? "" : "s"}`,
     "status.drafting": "Drafting",
@@ -106,6 +111,8 @@ const STRINGS = {
     "portal.errDefault": "开始失败",
     "portal.errPasscode": "通关密语错误",
     "portal.errBusy": "Sandbox 都在用，稍后再试。",
+    "portal.expired": "上一个会话已达 6 小时上限，已结束。",
+    "countdown.tooltip": "会话自开始起 6 小时后结束，请在此之前导出代码。",
     "session.starting": "启动中…",
     "btn.stop": "停止",
     "btn.close": "终止",
@@ -130,6 +137,7 @@ const STRINGS = {
     "status.ready": "就绪",
     "status.disconnected": "连接已断开，刷新页面恢复",
     "status.closed": "会话已终止",
+    "status.expired": "会话已过期，请新建会话",
     "status.closeFailed": "结束会话失败，请重试。",
     "status.historyReplayed": (n) => `已重放 ${n} 条历史`,
     "status.drafting": "起草中",
@@ -620,6 +628,7 @@ function flashStoppingNote() {
 }
 
 function showPortal() {
+  stopCountdown();
   portalEl.style.display = "";
   chatHeader.style.display = "none";
   chatMain.style.display = "none";
@@ -639,6 +648,12 @@ function claimSession(id) {
   localStorage.setItem(STORAGE_KEY, sessionId);
   localStorage.setItem(LANG_KEY, lang);
   history.replaceState(null, "", `#session=${sessionId}&lang=${lang}`);
+}
+
+// EXPIRES_KEY describes the session in STORAGE_KEY, so the pair always clears together.
+function clearStoredSession() {
+  localStorage.removeItem(STORAGE_KEY);
+  localStorage.removeItem(EXPIRES_KEY);
 }
 
 // Show the public namespace in the header (never the secret session id).
@@ -661,14 +676,23 @@ async function ensureSession() {
   }
   const resumeId = fromHash || stored;
   if (!resumeId || !SESSION_ID_RE.test(resumeId)) {
-    localStorage.removeItem(STORAGE_KEY); // only a genuinely-bad/absent stored id reaches here → clear + portal
+    clearStoredSession(); // only a genuinely-bad/absent stored id reaches here → clear + portal
     showPortal();
     return false;
+  }
+  // A hash id from another session must not inherit the stored deadline.
+  let deadline = Number(localStorage.getItem(EXPIRES_KEY));
+  if (fromHash && fromHash !== stored) {
+    localStorage.removeItem(EXPIRES_KEY);
+    deadline = NaN;
   }
   resuming = true;
   claimSession(resumeId);
   setStatus(tr("status.connecting"));
   showChat();
+  // A locally-past deadline may be clock skew — never wipe the bearer on it; attach and let the server
+  // 404 (probeResumedSession) decide, while history.done re-syncs the countdown from the server value.
+  if (!deadlinePassed(deadline)) startCountdown(deadline);
   return true;
 }
 
@@ -693,6 +717,8 @@ portalForm.addEventListener("submit", async (evt) => {
   try {
     const started = await portalStartSession(passcode, lang);
     claimSession(started.sessionId);
+    if (started.expiresAt) localStorage.setItem(EXPIRES_KEY, String(started.expiresAt));
+    startCountdown(started.expiresAt);
     showSessionNs(started.ns);
     showChat();
     attachStream();
@@ -706,6 +732,50 @@ portalForm.addEventListener("submit", async (evt) => {
 
 let ws = null;
 let sessionClosed = false;
+let countdownTimer = null;
+
+function deadlinePassed(deadline) {
+  return Number.isFinite(deadline) && deadline > 0 && Date.now() >= deadline;
+}
+
+function fmtCountdown(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+}
+
+// Hitting 0 ends the session client-side; the server only enforces lazily on the next request.
+function startCountdown(expiresAt) {
+  if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+  const deadline = Number(expiresAt);
+  if (!countdownEl || !Number.isFinite(deadline) || deadline <= 0) return;
+  const tick = () => {
+    const left = deadline - Date.now();
+    if (left <= 0) { endSessionUi("status.expired"); return; }
+    countdownEl.textContent = `⏳ ${fmtCountdown(left)}`;
+  };
+  tick();
+  if (!sessionClosed) countdownTimer = setInterval(tick, 1000);
+}
+
+function stopCountdown() {
+  if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+  if (countdownEl) countdownEl.textContent = "";
+}
+
+function endSessionUi(statusKey) {
+  sessionClosed = true;
+  stopCountdown();
+  if (ws) { try { ws.close(1000, "session closed"); } catch { /* ignore */ } ws = null; }
+  if (evtSource) { try { evtSource.close(); } catch { /* ignore */ } evtSource = null; }
+  setStatus(tr(statusKey));
+  stopBtn.disabled = true;
+  sendBtn.disabled = true;
+  inputEl.disabled = true;
+  exportBtn.disabled = true;
+  attachBtn.disabled = true;
+  for (const b of messagesEl.querySelectorAll(".plan-card button")) b.disabled = true;
+}
 
 function attachStream() {
   attemptWebSocket((ok) => {
@@ -767,9 +837,11 @@ async function probeResumedSession() {
   } catch { /* network/abort — treat as transient */ }
   try { ac.abort(); } catch { /* ignore */ }  // don't consume the stream body
   if (status === 404) {
-    localStorage.removeItem(STORAGE_KEY);
+    const deadline = Number(localStorage.getItem(EXPIRES_KEY));
+    clearStoredSession();
     history.replaceState(null, "", location.pathname);
     showPortal();
+    if (deadlinePassed(deadline)) portalErrorEl.textContent = tr("portal.expired");
   } else {
     setStatus(tr("status.disconnected"));
   }
@@ -819,6 +891,10 @@ function handleEvent(type, data) {
       everConnected = true;
       adoptSessionLang(data?.lang);
       showSessionNs(data?.ns);
+      if (!sessionClosed && Number.isFinite(data?.expiresAt) && data.expiresAt > 0) {
+        localStorage.setItem(EXPIRES_KEY, String(data.expiresAt));  // authoritative — replaces any stale local copy
+        startCountdown(data.expiresAt);
+      }
       setStatus(tr("status.historyReplayed", data?.replayed ?? 0));
       break;
     case "run.scheduled": {
@@ -871,15 +947,7 @@ function handleEvent(type, data) {
       showPreview(data);
       break;
     case "session.closed":
-      sessionClosed = true;
-      if (ws) { try { ws.close(1000, "session closed"); } catch { /* ignore */ } ws = null; }
-      if (evtSource) { try { evtSource.close(); } catch { /* ignore */ } evtSource = null; }
-      setStatus(tr("status.closed"));
-      stopBtn.disabled = true;
-      sendBtn.disabled = true;
-      inputEl.disabled = true;
-      exportBtn.disabled = true;
-      attachBtn.disabled = true;
+      endSessionUi(data?.reason === "expired" ? "status.expired" : "status.closed");
       break;
   }
 }
@@ -899,6 +967,7 @@ async function send() {
     });
     if (!res.ok) {
       if (inputEl.value === "") inputEl.value = original;
+      if (res.status === 410) { endSessionUi("status.expired"); return; }
       setStatus(tr("err.sendFailed", res.status));
     }
   } catch {
@@ -963,6 +1032,7 @@ async function uploadFiles(fileList) {
     const res = await fetch(`${apiBase()}/upload`, { method: "POST", body: form });
     let data = null;
     try { data = await res.json(); } catch { /* non-json body */ }
+    if (res.status === 410) { endSessionUi("status.expired"); return; }
     if (!res.ok) {
       setStatus(tr("err.uploadFailed", data?.error || `HTTP ${res.status}`));
       return;
@@ -1039,6 +1109,7 @@ function renderPlanCard(runId, planText, kind, attempt = 0) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ runId, decision, note, attempt }),
       });
+      if (res.status === 410) { endSessionUi("status.expired"); return; }
       if (!res.ok) {
         setStatus(tr("plan.errFailed", res.status));
         approveBtn.disabled = reviseBtn.disabled = rejectBtn.disabled = false;
@@ -1085,6 +1156,7 @@ async function stop() {
   flashStoppingNote();
   try {
     const res = await fetch(`${apiBase()}/cancel`, { method: "POST" });
+    if (res.status === 410) { endSessionUi("status.expired"); return; }
     if (!res.ok) setStatus(tr("err.cancelFailed", res.status));
   } catch {
     setStatus(tr("err.cancelFailed", "network"));
@@ -1107,23 +1179,10 @@ async function close() {
     setStatus(tr("status.closeFailed"));
     return;
   }
-  if (ws) {
-    try { ws.close(1000, "user close"); } catch { /* ignore */ }
-    ws = null;
-  }
-  if (evtSource) {
-    try { evtSource.close(); } catch { /* ignore */ }
-    evtSource = null;
-  }
-  localStorage.removeItem(STORAGE_KEY);
+  clearStoredSession();
   history.replaceState(null, "", location.pathname);
   renderedMessageSeqs.clear();
-  setStatus(tr("status.closed"));
-  sendBtn.disabled = true;
-  stopBtn.disabled = true;
-  inputEl.disabled = true;
-  exportBtn.disabled = true;
-  attachBtn.disabled = true;
+  endSessionUi("status.closed");
 }
 
 sendBtn.addEventListener("click", send);

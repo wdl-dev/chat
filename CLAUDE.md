@@ -134,6 +134,11 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   MicroVM (Tokyo / ap-northeast-1), opened lazily on first tool use and terminated on
   Close. Reached over public HTTPS + a short-lived JWE; zero VPC. The broker is the sole
   AWS-key holder and exposes only open/mint/close — chat-worker never sees the AWS key.
+  VM lifetime is aligned to the 6h ns-token TTL (`MAX_LIFETIME_SECONDS`; idle-suspend
+  after 10min saves compute, but a suspended VM is never idle-terminated before the 6h
+  cap), so the only session death is the 6h clock — never a VM reclaimed out from under
+  a valid token. Suspended VMs still count against the Lambda "Max allocated memory"
+  quota, so abandoned sessions hold their memory for the full 6h.
 - **Real-time session start, not a preallocated pool.** Users land on `#portal`, enter the
   passcode (`DEMO_PASSCODE`), and `POST /portal/start`, which mints a fresh `tmp-<hex>` ns
   + ns token from auth `/auth/delegated-tokens` (template `wdl-chat-ns-pool`: kind ns,
@@ -142,6 +147,26 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   token self-expires (chat-worker holds only the narrow `token-issuer` credential and
   cannot revoke). Closed sessions are **not reaped** (known limitation): the `sessions_index`
   row + per-session DO SQLite persist until a retention policy is added.
+- **6h hard session lifetime, lazily enforced.** Sessions die at `created_at + 6h - 5min`
+  (`DELEGATED_TTL_MS` mirrors the `wdl-chat-ns-pool` template TTL — operator changes to the
+  template must update the constant). There is no reaper: the router's shared gates enforce
+  it on the next request that reaches them — `requireActiveSession` (messages/cancel/approve-plan/upload)
+  answers **410 "session expired"**, `proxyGetToDo` (stream/export) answers 404. Body
+  parsing/validation runs first, so a malformed write (empty/oversized/bad-JSON → 400/413)
+  rejects *before* the gate and does not expire; a session that only ever gets invalid
+  traffic falls back to the broker's 6h max VM lifetime. `expireSession`
+  tears down via DO `expire()` (= `_closeSession("expired")`: abort run, terminate VM,
+  broadcast `session.closed {reason:"expired"}`), falling back to `requestClose()` for DO
+  facets pinned to a pre-`expire()` version, then fences `sessions_index` to `closed`.
+  A run in flight when the deadline passes is aborted at the next workflow step boundary
+  (`_isCancelled` folds in `_cancelIfExpired` → cancel reason `"expired"`) — that path only
+  stops the run; VM/catalog teardown still waits for the next router access (or the broker's
+  6h max lifetime).
+  `/portal/start` returns `expiresAt` (the gate time); the SPA shows it as a live countdown
+  (`#countdown`), disables the composer at 0 client-side, treats any 410 as expiry, and
+  explains the expiry on the portal when a dead session is reopened cold. Deliberately no
+  recovery: no VM reopen, no workspace rebuild from history — the transcript stays readable
+  on screen, `Export` must happen before the deadline.
 - **Agent loop runs as a WDL Workflow.** `addUserMessage` starts a `ChatRunWorkflow`
   instance; the workflow drives the loop as `step.do` bodies on the DO. The platform's
   Workflows engine has at-least-once semantics — it can re-dispatch a step (forward-timeout

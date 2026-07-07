@@ -45,6 +45,7 @@ ${WDL_MARK}
     <svg class="logo-mark header-logo" aria-hidden="true"><use href="#wdl-mark"></use></svg>
     <span class="header-wordmark">WDL<span class="dot">·</span>CHAT</span>
     <span class="session-id" id="session-id" data-i18n="session.starting">Starting…</span>
+    <span class="status-text" id="countdown" data-i18n-title="countdown.tooltip"></span>
     <span class="status-text" id="status"></span>
     <div class="header-actions">
       <button id="btn-export" class="ghost" data-i18n="btn.export">Export</button>

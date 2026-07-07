@@ -100,9 +100,9 @@ test("openMicrovm: create RUNNING -> mint -> init returns the session handle", a
   // The create call carries the lifecycle policy.
   const create = calls[0].body;
   assert.equal(create.imageIdentifier, "arn:image");
-  assert.equal(create.maximumDurationInSeconds, 2 * 60 * 60);
+  assert.equal(create.maximumDurationInSeconds, 6 * 60 * 60);
   assert.equal(create.idlePolicy.maxIdleDurationSeconds, 10 * 60);
-  assert.equal(create.idlePolicy.suspendedDurationSeconds, 30 * 60);
+  assert.equal(create.idlePolicy.suspendedDurationSeconds, 6 * 60 * 60);
   // /init got the session context.
   assert.deepEqual(inits[0].init, { sessionId: "sess-1", ns: "tmp-1", adminUrl: "https://api", nsToken: "ns-tok" });
   assert.equal(inits[0].authToken, "jwe-1");
