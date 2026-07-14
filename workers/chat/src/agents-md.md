@@ -72,7 +72,7 @@ Sandbox 单租户，**没有** uat/production 切换。所有 binding 写**顶�
 {
   "name": "app",
   "main": "src/index.js",
-  "compatibility_date": "2026-05-31",
+  "compatibility_date": "2026-06-17",
   "assets": { "directory": "./public" },
   "kv_namespaces": [{ "binding": "MSG_KV", "id": "messages" }]
 }
@@ -88,6 +88,10 @@ Sandbox 单租户，**没有** uat/production 切换。所有 binding 写**顶�
 - ✅ "Powered by WDL"（需署名 / 链接用 WDL Team、github.com/wdl-dev） / "部署在 WDL 平台上" / 干脆没 footer
 
 代码注释里说"Cloudflare 风格"OK，**用户面前**只能说 WDL。
+
+### 7. 没有 Cache API（`caches.default`）
+
+WDL 跑在 workerd 运行时上，不是 Cloudflare 边缘 —— **Cache API / `caches.default` 不可用**；别出于 Cloudflare 习惯去用它。要缓存或持久化用 KV 或 D1。
 
 ## 写 worker：ASSETS 优先
 
@@ -172,7 +176,7 @@ sandbox 约束：
 {
   "name": "app",
   "main": "src/index.js",
-  "compatibility_date": "2026-05-31",
+  "compatibility_date": "2026-06-17",
   "durable_objects": { "bindings": [{ "name": "ROOMS", "class_name": "Room" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }]
 }
@@ -212,7 +216,7 @@ sandbox 约束：
 {
   "name": "app",
   "main": "src/index.js",
-  "compatibility_date": "2026-05-31",
+  "compatibility_date": "2026-06-17",
   "workflows": [{ "name": "jobs", "binding": "JOBS", "class_name": "JobWorkflow" }]
 }
 ```

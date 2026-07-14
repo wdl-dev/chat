@@ -72,7 +72,7 @@ The Sandbox is single-tenant, with **no** uat/production switching. Write every 
 {
   "name": "app",
   "main": "src/index.js",
-  "compatibility_date": "2026-05-31",
+  "compatibility_date": "2026-06-17",
   "assets": { "directory": "./public" },
   "kv_namespaces": [{ "binding": "MSG_KV", "id": "messages" }]
 }
@@ -88,6 +88,10 @@ In user-visible places — page footers, JSON responses, email bodies:
 - ✅ "Powered by WDL" (for attribution / links use the WDL Team, github.com/wdl-dev) / "Deployed on the WDL platform" / just no footer
 
 Saying "Cloudflare-style" in code comments is OK; **in front of the user**, only say WDL.
+
+### 7. No Cache API (`caches.default`)
+
+WDL runs on workerd's surface, not Cloudflare's edge — the **Cache API / `caches.default` is not available**; don't reach for it out of Cloudflare habit. For caching or persistence use KV or D1.
 
 ## Writing a worker: ASSETS first
 
@@ -172,7 +176,7 @@ Sandbox constraints:
 {
   "name": "app",
   "main": "src/index.js",
-  "compatibility_date": "2026-05-31",
+  "compatibility_date": "2026-06-17",
   "durable_objects": { "bindings": [{ "name": "ROOMS", "class_name": "Room" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }]
 }
@@ -212,7 +216,7 @@ Sandbox constraints:
 {
   "name": "app",
   "main": "src/index.js",
-  "compatibility_date": "2026-05-31",
+  "compatibility_date": "2026-06-17",
   "workflows": [{ "name": "jobs", "binding": "JOBS", "class_name": "JobWorkflow" }]
 }
 ```
