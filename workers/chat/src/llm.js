@@ -89,32 +89,41 @@ export async function callLlmMessages({
     signal,
   };
   // Bounded retry on transient failures (network/429/5xx) — safe: side-effect-free before tools run.
+  // Log every retry: a 429 that later succeeds is otherwise invisible.
+  const startedAt = Date.now();
   let res;
-  for (let attempt = 1; ; attempt++) {
+  let attempt = 0;
+  for (;;) {
+    attempt++;
     try {
       res = await fetcher(`${baseUrl}/v1/messages`, init);
     } catch (err) {
       if (signal?.aborted || attempt >= maxAttempts) throw err;
+      console.warn(`LLM attempt ${attempt}/${maxAttempts} failed model=${chosenModel} cause=network`);
       await sleep(RETRY_DELAYS_MS[attempt - 1], signal);
       continue;
     }
     if ((res.status === 429 || res.status >= 500) && attempt < maxAttempts && !signal?.aborted) {
       try { await res.body?.cancel?.(); } catch { /* free the connection */ }
+      console.warn(`LLM attempt ${attempt}/${maxAttempts} failed model=${chosenModel} cause=${res.status}`);
       await sleep(RETRY_DELAYS_MS[attempt - 1], signal);
       continue;
     }
     break;
   }
-
   if (!res.ok) {
     await res.text().catch(() => {}); // drain the connection; don't log the body (it can echo prompt/context)
-    console.warn(`LLM HTTP ${res.status}`);
+    console.warn(`LLM HTTP ${res.status} model=${chosenModel} attempts=${attempt} ${Date.now() - startedAt}ms`);
     const err = new Error(`LLM HTTP ${res.status}`);
     err.status = res.status;
     throw err;
   }
-  if (!wantStream) return await res.json();
-  return await consumeAnthropicStream(res, onDelta);
+  // Log only once the body is fully parsed: 2xx headers can still be followed by a JSON/SSE read failure.
+  const parsed = wantStream ? await consumeAnthropicStream(res, onDelta) : await res.json();
+  if (attempt > 1) {
+    console.log(`LLM ok after ${attempt} attempts model=${chosenModel} ${Date.now() - startedAt}ms`);
+  }
+  return parsed;
 }
 
 // Returns the same shape as the non-streaming /v1/messages response.

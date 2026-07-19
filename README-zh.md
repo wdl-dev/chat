@@ -63,3 +63,8 @@ MicroVM 的公网 HTTPS endpoint（带 `X-aws-proxy-auth`）跑命令 / 部署�
 沙箱镜像单独构建：`bash scripts/build-microvm-image.sh`（打包 `{ Dockerfile, sandbox-agent }` → `update-microvm-image`；CLI 在镜像内从 npm 安装）。
 （`deploy:chat` / `deploy:frontend` 也可单独 `npm run`，但前端必须在 chat-worker 之后
 重部署才能 re-pin 到新版本。）
+
+每条部署路径随后都会跑 `scripts/prune-versions.sh`，它会**不可逆地删除**除最新 3 个之外的所有版本
+（active 版本始终保留）。这是 best effort —— 仍被其它 worker 引用的版本会被跳过、留到下次部署重试，
+且任何 prune 失败（包括配置写错）都不会让部署失败。要改保留数用 `WDL_PRUNE_KEEP=N`，它对链上每次
+prune 都生效，而 `--keep` 只能命中其中一次；想跳过清理就直接调 `wdl deploy`。

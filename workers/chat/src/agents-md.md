@@ -80,6 +80,8 @@ Sandbox 单租户，**没有** uat/production 切换。所有 binding 写**顶�
 
 加 `"env": { "uat": ... }` → 需要 `--env uat` 才能 deploy，sandbox 不传 → fail。`/opt/wdl-cli/docs/env-overrides.md` 是开发机用法，sandbox **不适用**。
 
+以下 Cloudflare 习惯字段**部署时会被拒**，别加：`observability`（新版 `wrangler init` 脚手架会生成它，删掉）、`limits`、`placement`、`workers_dev`、`pages_build_output_dir`、老式 `[site]`。
+
 ### 6. 输出给用户不提 Cloudflare
 
 页面 footer、JSON 响应、邮件正文等用户可见的地方：
@@ -203,13 +205,16 @@ export default {
 
 支持 `stub.fetch()`、JSON-RPC `stub.method(...)`、`ctx.storage` / 同步 `ctx.storage.sql`、alarm、WebSocket（普通 upgrade + hibernation）。细节 `read_file /opt/wdl-cli/docs/durable-objects.md`。
 
+**RPC 参数必须是纯 JSON 数据**（≤ 1 MiB，`stub.fetch()` body 同上限）：有限数字、字符串、布尔、`null`、稠密数组、plain object。校验**从不调用 `toJSON()`** —— 所以 `new Date()` 会报 `must be a plain JSON object`（路径指向出问题的那个参数，如 `rpc.args[0].ts`），哪怕 `JSON.stringify` 本来能处理它；`Map` / `Set` / `URL` / class 实例同理。另外这些也拒：`undefined`、函数、`BigInt`、symbol、`NaN`/`Infinity`、稀疏数组、循环引用。传 `Date.now()` 或 `d.toISOString()`，在 DO 内部再还原成 Date。
+
 ## 长流程（Workflows）
 
 需要**多步、可能很久、要 durable 重试或等外部事件**的东西用 Workflow：多步 build/审批 pipeline、定时任务（`step.sleep("daily", "12h")`）、调用慢 API 并自动重试、等用户确认再继续（`step.waitForEvent`）。每个 `step.do(name, fn)` 的结果会 durable 落盘，中途崩溃/重投只重跑没完成的 step。
 
 sandbox 约束：
 - `WorkflowEntrypoint` class 要 `export`，worker 名 `app`，配置扁平
-- 同一 `Promise.all([step.do(...), step.do(...)])` 里的 step 并行执行（DAG）；但**实例总量（各 step 结果累计）≤ 16 MiB** —— 大数据存 D1/R2/KV，step 只存指针。**别用 `Promise.race`** 只取最快的 step 然后直接 sleep/wait —— 先 settle 或 cancel 掉应用侧并发，再让 workflow 挂起
+- 同一 `Promise.all([step.do(...), step.do(...)])` 里的 step 并行执行（DAG）；但**单个 step 结果 ≤ 1 MiB**、**单实例聚合 payload ≤ 16 MiB** —— 这个额度把 `create()` 参数、每个 step 的输出和错误、event payload、最终结果全算在内，所以大数据存 D1/R2/KV，step 只存指针。**别用 `Promise.race`** 只取最快的 step 然后直接 sleep/wait —— 先 settle 或 cancel 掉应用侧并发，再让 workflow 挂起
+- **启动的每个 `step.do` 都必须在 `run()` 返回前 await 完** —— 发了不管、留着未结算的 step 会让整个 run 以 `workflow_invalid_step` 失败。并行兄弟 step 要在一次同步扇出里创建、再一起 await，然后才能开始下一批持久化 step；别一边 await 某个兄弟一边还在创建其它的
 - 部署照常 `deploy_test`；查实例状态用 `run_command` 跑 `wdl workflows status app <workflowName> <id> --include-steps`
 
 ```jsonc

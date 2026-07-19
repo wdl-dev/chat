@@ -80,6 +80,8 @@ The Sandbox is single-tenant, with **no** uat/production switching. Write every 
 
 Adding `"env": { "uat": ... }` → requires `--env uat` to deploy, the sandbox doesn't pass it → fail. `/opt/wdl-cli/docs/env-overrides.md` is dev-machine usage and **does not apply** to the sandbox.
 
+These Cloudflare-habit fields are **rejected at deploy** — don't add them: `observability` (recent `wrangler init` scaffolds emit it — delete it), `limits`, `placement`, `workers_dev`, `pages_build_output_dir`, legacy `[site]`.
+
 ### 6. Don't mention Cloudflare in output to the user
 
 In user-visible places — page footers, JSON responses, email bodies:
@@ -203,13 +205,16 @@ export default {
 
 Supports `stub.fetch()`, JSON-RPC `stub.method(...)`, `ctx.storage` / synchronous `ctx.storage.sql`, alarm, WebSocket (plain upgrade + hibernation). For details `read_file /opt/wdl-cli/docs/durable-objects.md`.
 
+**RPC args must be plain JSON data** (≤ 1 MiB, same cap for `stub.fetch()` bodies): finite numbers, strings, booleans, `null`, dense arrays, and plain objects. The check **never calls `toJSON()`**, so `new Date()` fails with a `must be a plain JSON object` error (the path points at the offending arg, e.g. `rpc.args[0].ts`) even though `JSON.stringify` would have accepted it — same for `Map` / `Set` / `URL` / class instances. Also rejected: `undefined`, functions, `BigInt`, symbols, `NaN`/`Infinity`, sparse arrays, circular refs. Pass `Date.now()` or `d.toISOString()` and rebuild the Date inside the DO.
+
 ## Long-running flows (Workflows)
 
 Use a Workflow for things that are **multi-step, possibly long, and need durable retries or to wait for external events**: multi-step build/approval pipelines, scheduled jobs (`step.sleep("daily", "12h")`), calling a slow API with automatic retries, waiting for the user to confirm before continuing (`step.waitForEvent`). Each `step.do(name, fn)` result is durably persisted; a crash/redelivery mid-way only re-runs the steps that didn't complete.
 
 Sandbox constraints:
 - the `WorkflowEntrypoint` class must be `export`ed, the worker name is `app`, the config is flat
-- steps inside the same `Promise.all([step.do(...), step.do(...)])` run in parallel (a DAG); but the **instance total (sum of all step results) ≤ 16 MiB** — store large data in D1/R2/KV and keep only pointers in steps. **Don't use `Promise.race`** to take only the fastest step and then sleep/wait directly — first settle or cancel the app-side concurrency, then suspend the workflow
+- steps inside the same `Promise.all([step.do(...), step.do(...)])` run in parallel (a DAG); but a **single step result ≤ 1 MiB** and the **per-instance aggregate payload ≤ 16 MiB** — that budget counts the `create()` params, every step output and error, event payloads, and the terminal result, so store large data in D1/R2/KV and keep only pointers in steps. **Don't use `Promise.race`** to take only the fastest step and then sleep/wait directly — first settle or cancel the app-side concurrency, then suspend the workflow
+- **every `step.do` you start must be awaited before `run()` returns** — a fire-and-forget step left unsettled fails the run as `workflow_invalid_step`. Create parallel siblings in one synchronous fan-out, then await them together before starting the next durable batch; don't await one sibling while others are still being created
 - deploy as usual with `deploy_test`; check instance state with `run_command` running `wdl workflows status app <workflowName> <id> --include-steps`
 
 ```jsonc

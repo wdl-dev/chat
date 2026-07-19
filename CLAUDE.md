@@ -77,6 +77,16 @@ is a thin live-stack harness driven by `WDL_CHAT_BASE_URL` + `WDL_CHAT_PASSCODE`
 - Deploy: `npm run deploy:sandbox-broker` / `deploy:chat` / `deploy:frontend` (each
   `wdl deploy . --ns demo` via the wdl-cli token store), or `bash scripts/deploy-workers.sh`
   for chat + frontend in order (regenerates `agents-md.gen.js`, then re-pins the frontend).
+- **Every deploy path then prunes old versions — irreversibly.** `scripts/prune-versions.sh <worker>
+  --ns <ns> [--keep N]` keeps the newest 3 (plus the active one) and deletes the rest, walking the
+  binding chain `chat → chat-worker → sandbox-broker` because freeing a caller's versions is what
+  makes the callee's deletable. It is best effort: a version another worker still pins answers
+  `409 version_referenced` and is retried by the next deploy, and nothing it does — including a bad
+  config — ever exits non-zero, so a tidy-up can't make CI retry a deploy that already succeeded.
+  Override retention with `WDL_PRUNE_KEEP=N` (applies to every prune in the chain; `--keep` only
+  reaches the single invocation it is attached to); to skip pruning entirely, run `wdl deploy`
+  directly instead of the npm script. **Rollback targets beyond the newest 3 are gone**, so pin/copy
+  a version first if you need to go further back.
 - Worker deploys use the **open-source `wdl-cli`** (`@wdl-dev/cli`, github.com/wdl-dev/cli);
   it implements `[durable_objects]` and `[[workflows]]`. The global `wdl` on PATH works for
   d1 / secret / migrations / workers / delete / workflows.

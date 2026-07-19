@@ -44,5 +44,12 @@ if [[ "$SKIP" != "frontend" ]]; then
   ( cd "$ROOT/workers/frontend" && "$WDL_BIN" deploy . --ns "$WDL_NS" )
 fi
 
+# Prune down the binding chain: each worker's old versions pin the next one's, so freeing a caller's
+# versions is what makes the callee's deletable. frontend(chat) -> chat-worker -> sandbox-broker.
+echo "==> pruning old versions (keep newest ${WDL_PRUNE_KEEP:-3})"
+for w in chat chat-worker sandbox-broker; do
+  "$HERE/prune-versions.sh" "$w" --ns "$WDL_NS"
+done
+
 echo
 echo "==> done"

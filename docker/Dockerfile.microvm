@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
 # symlink to the CLI package so pack.js, the read allowlist, the prompt, and WDL_CLI_LOCAL_PATH keep
 # using /opt/wdl-cli/{lib,docs,examples}. --omit=dev keeps wrangler's optionalDependencies (platform
 # esbuild/workerd) so a dry-run doesn't fetch them at runtime.
-RUN npm install -g pnpm @wdl-dev/cli@1.4.1 --omit=dev --no-audit --no-fund \
+RUN npm install -g pnpm @wdl-dev/cli@1.5.0 --omit=dev --no-audit --no-fund \
     && ln -s "$(npm root -g)/@wdl-dev/cli" /opt/wdl-cli \
     && ln -s /opt/wdl-cli/node_modules/.bin/wrangler /usr/local/bin/wrangler
 ENV WDL_CLI_LOCAL_PATH=/opt/wdl-cli

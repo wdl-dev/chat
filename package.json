@@ -17,9 +17,9 @@
     "test": "node --test workers/*/test/*.test.js sandbox-agent/test/*.test.js",
     "check": "git ls-files '*.js' '*.mjs' | xargs -n1 node --check",
     "test:e2e": "node --test tests/e2e/*.test.js",
-    "deploy:sandbox-broker": "cd workers/sandbox-broker && wdl deploy . --ns demo",
-    "deploy:chat": "cd workers/chat && wdl deploy . --ns demo",
-    "deploy:frontend": "cd workers/frontend && wdl deploy . --ns demo",
+    "deploy:sandbox-broker": "cd workers/sandbox-broker && wdl deploy . --ns demo && cd ../.. && scripts/prune-versions.sh sandbox-broker --ns demo",
+    "deploy:chat": "cd workers/chat && wdl deploy . --ns demo && cd ../.. && scripts/prune-versions.sh chat-worker --ns demo && scripts/prune-versions.sh sandbox-broker --ns demo",
+    "deploy:frontend": "cd workers/frontend && wdl deploy . --ns demo && cd ../.. && scripts/prune-versions.sh chat --ns demo && scripts/prune-versions.sh chat-worker --ns demo && scripts/prune-versions.sh sandbox-broker --ns demo",
     "bootstrap": "node scripts/bootstrap.js"
   },
   "engines": {

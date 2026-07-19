@@ -89,3 +89,9 @@ The sandbox image is built separately: `bash scripts/build-microvm-image.sh`
 `deploy:frontend` can be run individually, but the frontend must be redeployed
 *after* chat-worker to re-pin its service binding to the new version.
 
+Every deploy path then runs `scripts/prune-versions.sh`, which **irreversibly deletes** all but the
+newest 3 versions (the active one is always kept). It is best effort — a version another worker still
+pins is left alone and retried next deploy, and no prune failure (including a bad config) ever fails
+the deploy. Set `WDL_PRUNE_KEEP=N` for a different retention — it applies to every prune in the
+chain, whereas `--keep` only reaches one — or call `wdl deploy` directly to skip pruning.
+

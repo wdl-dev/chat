@@ -233,6 +233,49 @@ test("approve-plan forwards the plan_approval event on the happy path", async ()
   assert.equal(events2[0].type, "plan_approval-1");  // server attempt, not the client's 2
 });
 
+// Issuer that fails `failures` times with (status, errorCode) before succeeding; counts calls.
+function flakyMint(failures, status, errorCode) {
+  const state = { calls: 0 };
+  const fetcher = async () => {
+    state.calls++;
+    if (state.calls <= failures) {
+      return { ok: false, status, async text() { return JSON.stringify({ error: errorCode, message: "x" }); } };
+    }
+    return { ok: true, status: 200, async text() { return JSON.stringify({ token: "ns-tok", ns: "tmp-xyz", tokenId: "tid-1" }); } };
+  };
+  return { fetcher, state };
+}
+
+test("portal/start retries a busy issuer lock and succeeds", async () => {
+  const { fetcher, state } = flakyMint(2, 409, "delegated_issue_busy");
+  const res = await handleRequest(req("POST", "/portal/start", { json: { passcode: "pass-123" } }), makeEnv(), fetcher);
+  assert.equal(res.status, 200);
+  assert.equal(state.calls, 3, "should retry past two busy responses");
+});
+
+test("portal/start does NOT retry active_quota_exceeded (a real ceiling, not contention)", async () => {
+  const { fetcher, state } = flakyMint(1, 409, "active_quota_exceeded");
+  const res = await handleRequest(req("POST", "/portal/start", { json: { passcode: "pass-123" } }), makeEnv(), fetcher);
+  assert.equal(res.status, 503);
+  assert.equal(state.calls, 1, "quota exhaustion must fail fast, not burn the user's wait");
+});
+
+test("portal/start does NOT retry a network failure (mint is not idempotent)", async () => {
+  // A lost response may mean the token WAS minted; retrying would strand tokens this worker can't revoke.
+  let calls = 0;
+  const fetcher = async () => { calls++; throw new Error("connect ECONNRESET"); };
+  const res = await handleRequest(req("POST", "/portal/start", { json: { passcode: "pass-123" } }), makeEnv(), fetcher);
+  assert.equal(res.status, 502);
+  assert.equal(calls, 1);
+});
+
+test("portal/start gives up after the busy-retry ladder is exhausted", async () => {
+  const { fetcher, state } = flakyMint(99, 409, "delegated_issue_busy");
+  const res = await handleRequest(req("POST", "/portal/start", { json: { passcode: "pass-123" } }), makeEnv(), fetcher);
+  assert.equal(res.status, 503);
+  assert.equal(state.calls, 4, "1 initial + 3 backoff attempts");
+});
+
 test("portal/start mints a session with a random id decoupled from the public ns", async () => {
   const before = Date.now();
   const res = await handleRequest(req("POST", "/portal/start", { json: { passcode: "pass-123", lang: "zh" } }), makeEnv(), fakeMint());

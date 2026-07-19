@@ -9,6 +9,11 @@ const DELEGATED_TEMPLATE = "wdl-chat-ns-pool";
 // The wdl-chat-ns-pool template's server-side TTL.
 const DELEGATED_TTL_MS = 6 * 60 * 60_000;
 const NS_TOKEN_EXPIRY_MARGIN_MS = 5 * 60_000;
+// Each retry sleeps base..2*base; the whole ladder adds under ~1.6s to a start that would otherwise 503.
+const DELEGATED_ISSUE_BACKOFF_MS = [80, 200, 500];
+const DELEGATED_ISSUE_MAX_ATTEMPTS = DELEGATED_ISSUE_BACKOFF_MS.length + 1;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const MAX_JSON_BODY_BYTES = 256 * 1024; // bounds JSON body parse cost (>> the 50KB message cap)
 const MAX_USER_MESSAGE_BYTES = 50_000;
@@ -24,9 +29,7 @@ function getDoStub(env, sessionId) {
   return env.CHAT_SESSION_DO.get(id);
 }
 
-async function mintDelegatedNs(env, fetcher) {
-  if (!env.ADMIN_URL) throw httpError(503, "ADMIN_URL not configured");
-  if (!env.TOKEN_ISSUER_TOKEN) throw httpError(503, "TOKEN_ISSUER_TOKEN not configured");
+async function mintDelegatedNsOnce(env, fetcher) {
   let res;
   try {
     res = await fetcher(`${env.ADMIN_URL}/auth/delegated-tokens`, {
@@ -36,18 +39,47 @@ async function mintDelegatedNs(env, fetcher) {
       signal: AbortSignal.timeout(15_000),
     });
   } catch (err) {
-    console.warn(`delegated token issue unreachable: ${errMessage(err)}`);
-    throw httpError(502, "delegated token issue unreachable");
+    return { ok: false, status: 0, reason: "unreachable", detail: errMessage(err) };
   }
   const text = await res.text();
   let data;
   try { data = text ? JSON.parse(text) : {}; } catch { data = {}; }
   if (!res.ok || typeof data?.token !== "string" || typeof data?.ns !== "string") {
-    const status = res.status === 409 ? 503 : 502;
-    console.warn(`delegated token issue failed (${res.status})`); // don't log the body — it can carry a minted token
-    throw httpError(status, "delegated token issue failed");
+    // `error` is the auth reason code; the rest of the body can carry a minted token, so never log it.
+    return { ok: false, status: res.status, reason: typeof data?.error === "string" ? data.error : "" };
   }
-  return { ns: data.ns, nsToken: data.token, tokenId: data.tokenId };
+  return { ok: true, ns: data.ns, nsToken: data.token, tokenId: data.tokenId };
+}
+
+async function mintDelegatedNs(env, fetcher) {
+  if (!env.ADMIN_URL) throw httpError(503, "ADMIN_URL not configured");
+  if (!env.TOKEN_ISSUER_TOKEN) throw httpError(503, "TOKEN_ISSUER_TOKEN not configured");
+  const startedAt = Date.now();
+  let attempt = 0;
+  for (;;) {
+    attempt++;
+    const out = await mintDelegatedNsOnce(env, fetcher);
+    if (out.ok) {
+      if (attempt > 1) {
+        console.log(`delegated token issued after ${attempt} attempts in ${Date.now() - startedAt}ms`);
+      }
+      return { ns: out.ns, nsToken: out.nsToken, tokenId: out.tokenId };
+    }
+    // The issuer holds one lock per (issuer, template) and rejects rather than waits, so concurrent
+    // "start session" requests all but one get 409 delegated_issue_busy — the only retriable code.
+    // Minting has no idempotency key: a lost response may already have created a token this worker can
+    // neither see nor revoke, so never retry a network throw. active_quota_exceeded is a real ceiling.
+    const retriable = out.status === 409 && out.reason === "delegated_issue_busy";
+    if (!retriable || attempt >= DELEGATED_ISSUE_MAX_ATTEMPTS) {
+      const what = out.reason === "unreachable" ? `unreachable: ${out.detail}` : `${out.status} ${out.reason || "-"}`;
+      console.warn(`delegated token issue failed (${what}) after ${attempt} attempts in ${Date.now() - startedAt}ms`);
+      throw httpError(out.status === 409 ? 503 : 502, out.reason === "unreachable"
+        ? "delegated token issue unreachable"
+        : "delegated token issue failed");
+    }
+    const base = DELEGATED_ISSUE_BACKOFF_MS[attempt - 1];
+    await sleep(base + Math.floor(Math.random() * base));
+  }
 }
 
 async function lookupSessionIndex(env, sessionId) {
