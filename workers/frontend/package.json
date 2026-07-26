@@ -7,6 +7,6 @@
     "dry-run": "wrangler deploy --dry-run --outdir=.deploy-dist"
   },
   "devDependencies": {
-    "wrangler": "^4"
+    "wrangler": "^4.114.0"
   }
 }
