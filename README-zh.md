@@ -4,9 +4,9 @@
 
 **一个构建 WDL Worker 的 WDL Worker。** wdl-chat 是一个 AI agent——它自己就部署在 WDL 上——把一句话变成运行中的 worker：MicroVM sandbox 编译 → 部署到临时 ns → 调试 + 预览。
 
-不是平台代码，是**跑在 WDL 平台上的产品**（一个普通租户）。用开源 [`@wdl-dev/cli`](https://github.com/wdl-dev/cli) CLI（`npm i -g @wdl-dev/cli`），跟其他租户一样。平台本体见 [wdl-dev/wdl](https://github.com/wdl-dev/wdl)。线上：**https://chat.wdl.dev**。
+不是平台代码，是**跑在 WDL 平台上的 dogfooding 应用**（一个普通租户）。用开源 [`@wdl-dev/cli`](https://github.com/wdl-dev/cli) CLI（`npm i -g @wdl-dev/cli`），跟其他租户一样。平台本体见 [wdl-dev/wdl](https://github.com/wdl-dev/wdl)。线上：**https://chat.wdl.dev**。
 
-> **定位 —— 参考 demo，不是生产级加固服务。** 这是"在 WDL 上做一个真实产品"的尽力而为示范：已部署、能用，但按 demo 维护——单测覆盖核心逻辑（解析、运行状态机、命令守卫、幂等）而非追求穷尽，Durable Object 与 VM 内 HTTP handler 没有直接测试 harness，少数边角以"已知限制"记录而非逐一修复。适合学习参考，别当作可直接投产的模板。
+> **定位 —— 参考 demo，不是生产级加固服务。** 这是"在 WDL 上做一个真实应用"的尽力而为示范——一次规模极大的 dogfooding，并会一直停留在这个阶段：已部署、能用，但按 demo 维护——单测覆盖核心逻辑（解析、运行状态机、命令守卫、幂等）而非追求穷尽，Durable Object 与 VM 内 HTTP handler 没有直接测试 harness，少数边角以"已知限制"记录而非逐一修复。已知安全边界在设计文档里有明确描述。适合作为了解各组成部分的参考，别当作可直接投产的模板。
 
 以 Apache-2.0 开源，见 [LICENSE](LICENSE)。工作区各 package 标记为 `private`：源码开放，但不发布到 npm。打包的第三方代码见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 

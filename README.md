@@ -9,19 +9,23 @@ English | [中文](README-zh.md)
 deployed on WDL — that turns one line into a running worker: build inside a
 MicroVM sandbox → deploy to a throwaway namespace → debug and preview.
 
-This is **not** platform code — it's a product that runs **as a tenant on the WDL
-platform**, the same way any other tenant would. It uses the open-source
-[`@wdl-dev/cli`](https://github.com/wdl-dev/cli) CLI (`npm i -g @wdl-dev/cli`); the platform
-itself is [wdl-dev/wdl](https://github.com/wdl-dev/wdl). Live at
+This is **not** platform code — it's a dogfooding application that runs **as a
+tenant on the WDL platform**, the same way any other tenant would. It uses
+the open-source [`@wdl-dev/cli`](https://github.com/wdl-dev/cli) CLI
+(`npm i -g @wdl-dev/cli`); the platform itself is
+[wdl-dev/wdl](https://github.com/wdl-dev/wdl). Live at
 **https://chat.wdl.dev**.
 
 > **Status — reference demo, not a hardened production service.** This is a
-> best-effort showcase of building a real product on WDL. It's deployed and it
-> works, but it is maintained as a demo: the unit suite covers the core logic
-> (parsing, the run state machine, the command guards, idempotency) rather than
-> exhaustively, the Durable Object and in-VM HTTP handlers have no direct test
-> harness, and a few rough edges are tracked as known limitations instead of fixed.
-> Learn from it — don't treat it as a turnkey production template.
+> best-effort demonstration of building a real application on WDL — an
+> extensive dogfooding exercise, and it will stay in that stage. It's deployed
+> and it works, but it is maintained as a demo: the unit suite covers the core
+> logic (parsing, the run state machine, the command guards, idempotency)
+> rather than exhaustively, the Durable Object and in-VM HTTP handlers have no
+> direct test harness, and a few rough edges are tracked as known limitations
+> instead of fixed. The known security boundaries are documented in the design
+> docs. It is useful as a reference for the moving parts, not as a turnkey
+> production template.
 
 Open source under Apache-2.0 — see [LICENSE](LICENSE). The workspace packages are marked
 `private`: the source is open, but nothing is published to npm. Bundled
