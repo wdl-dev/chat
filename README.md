@@ -87,6 +87,7 @@ You need two credentials from your WDL platform operator: (1) a normal per-ns to
    echo -n <arn> | wdl secret put MICROVM_IMAGE_ARN --worker sandbox-broker --ns demo  # name-based ARN, see "built separately" below
 3. set chat-worker secrets (--worker chat-worker --ns demo):
    OPERATOR_TOKEN / LLM_API_KEY / ADMIN_URL / DEMO_PASSCODE   (TOKEN_ISSUER_TOKEN was set in step 1)
+   # EXA_API_KEY (optional) backs the web_search / web_fetch tools; unset, they answer "not configured".
    # LLM_API_KEY must match the default provider (DeepSeek, Anthropic wire). For a different
    # provider set the whole LLM_* group together: LLM_API_SHAPE / LLM_BASE_URL / LLM_MODEL /
    # LLM_MODEL_LITE (+ LLM_MAX_TOKENS_PARAM=max_completion_tokens for OpenAI reasoning models —

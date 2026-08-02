@@ -91,6 +91,35 @@ export const TOOL_DEFINITIONS = [
       required: [],
     },
   },
+  {
+    name: "web_search",
+    description:
+      "Web search. Returns { results: [{title, url, published?, highlights: [...]}] } — query-relevant " +
+      "excerpts, not full pages. Use for current library docs, API references, and anything likely newer " +
+      "than your training data; follow up with web_fetch on a promising result when you need the full page.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search query. Specific beats broad." },
+        numResults: { type: "integer", minimum: 1, maximum: 8, description: "Default 5." },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "web_fetch",
+    description:
+      "Fetch one URL as clean extracted text (boilerplate stripped — far fewer tokens than curling raw " +
+      "HTML). Returns { url, title, text }. Use after web_search, or on any URL the user gives you.",
+    input_schema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "The http(s) URL to fetch." },
+        maxChars: { type: "integer", minimum: 1000, maximum: 20000, description: "Text cap. Default 6000." },
+      },
+      required: ["url"],
+    },
+  },
 ];
 
 const ZH = {

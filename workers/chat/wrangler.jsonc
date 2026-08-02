@@ -50,4 +50,5 @@
   //   LLM_API_SHAPE          - optional; "openai" switches the wire format (default anthropic)
   //   ADMIN_URL              - https://api.wdl.dev
   //   DEMO_PASSCODE          - gates POST /portal/start (the portal login)
+  //   EXA_API_KEY            - optional; backs web_search / web_fetch (unset -> "not configured")
 }

@@ -88,7 +88,7 @@ const STRINGS = {
     "err.sendFailed": (s) => `Send failed: ${s}`,
     "err.initFailed": (m) => `Init failed: ${m}`,
     "tool.read_file": "read", "tool.write_file": "write", "tool.list_files": "list",
-    "tool.run_command": "run", "tool.deploy_test": "deploy", "tool.call_preview": "preview", "tool.tail_logs": "logs",
+    "tool.run_command": "run", "tool.deploy_test": "deploy", "tool.call_preview": "preview", "tool.tail_logs": "logs", "tool.web_search": "search", "tool.web_fetch": "fetch",
     "ui.thinking": "Thinking",
     "ui.thinkingLive": (s) => `Thinking ${s}s`,
     "plan.headerRevised": "Plan (revised) — please confirm again",
@@ -158,7 +158,7 @@ const STRINGS = {
     "err.sendFailed": (s) => `发送失败：${s}`,
     "err.initFailed": (m) => `初始化失败：${m}`,
     "tool.read_file": "读取", "tool.write_file": "写入", "tool.list_files": "列目录",
-    "tool.run_command": "执行", "tool.deploy_test": "部署", "tool.call_preview": "预览", "tool.tail_logs": "日志",
+    "tool.run_command": "执行", "tool.deploy_test": "部署", "tool.call_preview": "预览", "tool.tail_logs": "日志", "tool.web_search": "搜索", "tool.web_fetch": "抓取",
     "ui.thinking": "思考",
     "ui.thinkingLive": (s) => `思考中 ${s}s`,
     "plan.headerRevised": "Plan（已修订）— 请再次确认",
@@ -226,7 +226,7 @@ portalLangEl?.addEventListener("click", (e) => {
   if (b) setLang(b.dataset.lang);
 });
 
-const TOOL_NAMES = new Set(["read_file", "write_file", "list_files", "run_command", "deploy_test", "call_preview", "tail_logs"]);
+const TOOL_NAMES = new Set(["read_file", "write_file", "list_files", "run_command", "deploy_test", "call_preview", "tail_logs", "web_search", "web_fetch"]);
 function toolVerb(name) { return TOOL_NAMES.has(name) ? tr("tool." + name) : name; }
 
 const planModeEnabled = (() => {
@@ -559,6 +559,8 @@ function toolDetail(name, input) {
     case "list_files":   return i.path || "/workspace";
     case "run_command":  return truncate(String(i.cmd || ""), 100);
     case "call_preview": return `${String(i.method || "GET").toUpperCase()} ${i.path || "/"}`;
+    case "web_search":   return truncate(String(i.query || ""), 80);
+    case "web_fetch":    return truncate(String(i.url || ""), 80);
     case "deploy_test":
     case "tail_logs":    return "";
     default:             return truncate(JSON.stringify(i), 80);

@@ -716,6 +716,75 @@ async function tailLogs(ctx, input, signal, fetcher) {
   return { events, bytes, truncated, error: networkError };
 }
 
+const EXA_TIMEOUT_MS = 20_000;
+const WEB_SEARCH_MAX_RESULTS = 8;
+const WEB_SEARCH_DEFAULT_RESULTS = 5;
+const WEB_FETCH_MAX_CHARS = 20_000;
+const WEB_FETCH_DEFAULT_CHARS = 6_000;
+
+// Exa error bodies carry only a requestId and validation detail, but stay uniform with the
+// LLM-side policy anyway: surface the status only.
+async function exaPost(ctx, path, payload, parentSignal, fetcher) {
+  if (!ctx.env?.EXA_API_KEY) return { error: "not configured" };
+  const ac = new AbortController();
+  const onParentAbort = () => ac.abort();
+  parentSignal?.addEventListener?.("abort", onParentAbort, { once: true });
+  const timer = setTimeout(() => ac.abort(), EXA_TIMEOUT_MS);
+  try {
+    const res = await fetcher(`https://api.exa.ai${path}`, {
+      method: "POST",
+      headers: { "x-api-key": ctx.env.EXA_API_KEY, "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: ac.signal,
+    });
+    // A response that returns headers and then hangs its body must still hit the deadline and
+    // still be cancellable by a user Stop.
+    const body = await res.text();
+    if (!res.ok) return { error: `HTTP ${res.status}` };
+    return { json: parseJson(body) };
+  } catch (err) {
+    return { error: `request failed: ${errMessage(err)}` };
+  } finally {
+    clearTimeout(timer);
+    parentSignal?.removeEventListener?.("abort", onParentAbort);
+  }
+}
+
+async function webSearch(ctx, input, parentSignal, fetcher) {
+  const query = typeof input?.query === "string" ? input.query.trim() : "";
+  if (!query) return { error: "query required" };
+  const numResults = clampInt(input?.numResults, 1, WEB_SEARCH_MAX_RESULTS, WEB_SEARCH_DEFAULT_RESULTS);
+  const { json, error } = await exaPost(ctx, "/search",
+    { query, type: "auto", numResults, contents: { highlights: true } }, parentSignal, fetcher);
+  if (error) return { error: `search ${error}` };
+  if (!Array.isArray(json?.results)) return { error: "search returned an unexpected shape" };
+  return {
+    query,
+    results: json.results.map((r) => ({
+      title: r?.title ?? "",
+      url: r?.url ?? "",
+      ...(r?.publishedDate ? { published: r.publishedDate } : {}),
+      highlights: Array.isArray(r?.highlights) ? r.highlights.slice(0, 5) : [],
+    })),
+  };
+}
+
+async function webFetch(ctx, input, parentSignal, fetcher) {
+  const url = typeof input?.url === "string" ? input.url.trim() : "";
+  if (!/^https?:\/\//.test(url)) return { error: "url must be http(s)" };
+  const maxCharacters = clampInt(input?.maxChars, 1000, WEB_FETCH_MAX_CHARS, WEB_FETCH_DEFAULT_CHARS);
+  // On /contents the text options are top-level, unlike /search where they nest under `contents`.
+  const { json, error } = await exaPost(ctx, "/contents",
+    { urls: [url], text: { maxCharacters, verbosity: "compact" } }, parentSignal, fetcher);
+  if (error) return { error: `fetch ${error}` };
+  const row = json?.results?.[0];
+  if (!row?.text) {
+    const st = json?.statuses?.[0]?.error;
+    return { error: st ? `could not fetch ${url}: ${st.tag ?? "error"}${st.httpStatusCode ? ` (${st.httpStatusCode})` : ""}` : "no content returned" };
+  }
+  return { url: row.url ?? url, title: row.title ?? "", text: row.text };
+}
+
 const REGISTRY = {
   read_file:    readFile,
   write_file:   writeFile,
@@ -724,6 +793,8 @@ const REGISTRY = {
   deploy_test:  deployTest,
   call_preview: callPreview,
   tail_logs:    tailLogs,
+  web_search:   webSearch,
+  web_fetch:    webFetch,
 };
 
 export async function dispatchTool({ name, input, ctx, signal, fetcher = fetch, sleep = realSleep }) {

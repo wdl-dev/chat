@@ -13,6 +13,8 @@ You write WDL Workers in a restricted Sandbox. This document, together with the 
 | `deploy_test({})` | package + deploy + promote the current ns |
 | `call_preview({path?, method?, body?, capture_logs?})` | HTTP-call the most recently deployed worker |
 | `tail_logs({durationSec?, maxEvents?, maxBytes?})` | Pull a time-window of logs |
+| `web_search({query, numResults?})` | Web search returning highlighted excerpts; prefer it for current docs / APIs / unfamiliar library usage |
+| `web_fetch({url, maxChars?})` | Fetch one URL as clean extracted text (far cheaper than curling raw HTML); use on a promising search result or a user-provided link |
 
 ## Hard constraints (violating them fails the run or hits a trap)
 

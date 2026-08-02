@@ -13,6 +13,8 @@
 | `deploy_test({})` | package + 部署 + promote 当前 ns |
 | `call_preview({path?, method?, body?, capture_logs?})` | HTTP 调最近部署的 worker |
 | `tail_logs({durationSec?, maxEvents?, maxBytes?})` | 拉时间窗口日志 |
+| `web_search({query, numResults?})` | 联网搜索，返回带高亮摘录的结果；查最新文档 / API / 不确定的库用法优先用它 |
+| `web_fetch({url, maxChars?})` | 抓取单个 URL 的清洗后正文（比 curl 原始 HTML 省得多）；search 命中后取全文、或用户给了链接时用 |
 
 ## 硬约束（违反会直接 fail 或撞坑）
 

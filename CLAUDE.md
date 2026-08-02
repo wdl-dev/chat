@@ -134,7 +134,8 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
 
 - chat-worker: `TOKEN_ISSUER_TOKEN` (narrow token-issuer credential — mints per-session ns
   tokens), `OPERATOR_TOKEN` (operator `/admin/*` endpoints), `LLM_API_KEY` (the LLM provider
-  key), `ADMIN_URL` (`https://api.wdl.dev`), `DEMO_PASSCODE` (portal gate); plus the optional
+  key), `ADMIN_URL` (`https://api.wdl.dev`), `DEMO_PASSCODE` (portal gate), `EXA_API_KEY` (backs `web_search` / `web_fetch`; unset → both
+  answer "not configured" and everything else still works); plus the optional
   `LLM_*` overrides (`LLM_API_SHAPE` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_MODEL_LITE` /
   `LLM_MAX_TOKENS` / `LLM_MAX_TOKENS_PARAM` / `LLM_BUDGET_MS` / `LLM_REASONING_EFFORT`) — these pin
   the live provider; see the LLM design decision for the current pick and its constraints
@@ -347,8 +348,17 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   would strip every thinking block we ever get — the exact silent degradation the rule above forbids —
   and rejecting unsigned thinking before running tools would fail every tool turn. Anthropic proper
   does sign; gate either idea on the provider if that endpoint is ever used directly.
+- **`web_search` / `web_fetch` are our tools, not the provider's.** DeepSeek has no native web search,
+  and provider-side search (xAI Live Search, Aliyun `enable_search`) would vanish on every model switch
+  and bypass the loop's salvage/progress/idempotency machinery. Both run in chat-worker against Exa
+  (`EXA_API_KEY` secret the model never sees, shared `exaPost` scaffold): `web_search` = `/search`
+  (`type: auto`, highlights only — token-bounded excerpts, capped at 8 results); `web_fetch` =
+  `/contents` (boilerplate-stripped page text, `maxCharacters`-capped — far cheaper than curling raw
+  HTML from the VM, which stays possible). Both are read-only (parallel batch) and **sandboxless**: a
+  batch of only these must not boot or wait on a MicroVM (`SANDBOXLESS_TOOLS`). Exa reachability from
+  the ap-east-1 egress is probe-verified.
 - **Parallel read-only tool dispatch.** Contiguous read-only tool_uses (`read_file` /
-  `list_files` / `tail_logs`, in `READ_ONLY_TOOLS`) run in a Promise.all batch with one
+  `list_files` / `tail_logs` / `web_search` / `web_fetch`, in `READ_ONLY_TOOLS`) run in a Promise.all batch with one
   shared AbortController. Effectful tools (`write_file` / `run_command` / `deploy_test` /
   `call_preview`) stay serial because of the sandbox mutex and ordering.
 - **ASSETS-first guidance is a hard rule in the system prompt (promptPack) + AGENTS.md.** Without it the

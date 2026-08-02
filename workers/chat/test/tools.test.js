@@ -874,3 +874,83 @@ test("drainTailSse frames a CRLF-terminated tail stream", async () => {
   assert.equal(truncated, null);
   assert.deepEqual(events.map(e => e.data.m), [1, 2]);
 });
+
+test("web_search requires a key and a query, and maps the Exa response", async () => {
+  const { dispatchTool } = await import("../src/tools.js");
+  const noKey = await dispatchTool({ name: "web_search", input: { query: "x" }, ctx: { env: {} } });
+  assert.match(noKey.error, /not configured/);
+
+  const ctx = { env: { EXA_API_KEY: "k" } };
+  const noQuery = await dispatchTool({ name: "web_search", input: {}, ctx });
+  assert.match(noQuery.error, /query required/);
+
+  let captured;
+  const fetcher = async (url, init) => {
+    captured = { url, init };
+    return { ok: true, status: 200, text: async () => JSON.stringify({ results: [
+      { title: "T", url: "https://a", publishedDate: "2026-01-01", highlights: ["h1", "h2"] },
+      { title: null, url: "https://b" },
+    ] }) };
+  };
+  const r = await dispatchTool({ name: "web_search", input: { query: "  workerd alarms  ", numResults: 99 }, ctx, fetcher });
+  assert.equal(captured.url, "https://api.exa.ai/search");
+  assert.equal(captured.init.headers["x-api-key"], "k");
+  const body = JSON.parse(captured.init.body);
+  assert.equal(body.query, "workerd alarms");
+  assert.equal(body.numResults, 8);           // clamped to the max
+  assert.deepEqual(body.contents, { highlights: true });
+  assert.deepEqual(r.results, [
+    { title: "T", url: "https://a", published: "2026-01-01", highlights: ["h1", "h2"] },
+    { title: "", url: "https://b", highlights: [] },
+  ]);
+});
+
+test("web_search surfaces only the status on an HTTP error, and tolerates junk bodies", async () => {
+  const { dispatchTool } = await import("../src/tools.js");
+  const ctx = { env: { EXA_API_KEY: "k" } };
+  const err = await dispatchTool({ name: "web_search", input: { query: "x" }, ctx,
+    fetcher: async () => ({ ok: false, status: 402, text: async () => '{"error":"payment","requestId":"r1"}' }) });
+  assert.equal(err.error, "search HTTP 402");
+  const junk = await dispatchTool({ name: "web_search", input: { query: "x" }, ctx,
+    fetcher: async () => ({ ok: true, status: 200, text: async () => "not json" }) });
+  assert.match(junk.error, /unexpected shape/);
+});
+
+test("web_fetch validates the url, nests text options top-level, and maps statuses on failure", async () => {
+  const { dispatchTool } = await import("../src/tools.js");
+  const ctx = { env: { EXA_API_KEY: "k" } };
+  assert.match((await dispatchTool({ name: "web_fetch", input: {}, ctx })).error, /http\(s\)/);
+  assert.match((await dispatchTool({ name: "web_fetch", input: { url: "ftp://x" }, ctx })).error, /http\(s\)/);
+
+  let captured;
+  const ok = await dispatchTool({ name: "web_fetch", input: { url: "https://a.dev/x", maxChars: 999999 }, ctx,
+    fetcher: async (url, init) => { captured = { url, init };
+      return { ok: true, status: 200, text: async () => JSON.stringify({ results: [{ url: "https://a.dev/x", title: "T", text: "body" }] }) }; } });
+  assert.equal(captured.url, "https://api.exa.ai/contents");
+  const body = JSON.parse(captured.init.body);
+  assert.deepEqual(body.urls, ["https://a.dev/x"]);
+  assert.deepEqual(body.text, { maxCharacters: 20000, verbosity: "compact" });   // clamped
+  assert.deepEqual(ok, { url: "https://a.dev/x", title: "T", text: "body" });
+
+  const miss = await dispatchTool({ name: "web_fetch", input: { url: "https://a.dev/404" }, ctx,
+    fetcher: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ results: [], statuses: [{ id: "https://a.dev/404", status: "error", error: { tag: "CRAWL_NOT_FOUND", httpStatusCode: 404 } }] }) }) });
+  assert.match(miss.error, /CRAWL_NOT_FOUND \(404\)/);
+});
+
+test("exa deadline and Stop cover the body read, not just the headers", async () => {
+  const { dispatchTool } = await import("../src/tools.js");
+  const parent = new AbortController();
+  // Headers arrive fine; the body hangs until the request's own signal aborts it.
+  const fetcher = async (url, init) => ({
+    ok: true, status: 200,
+    text: () => new Promise((_, reject) => {
+      if (init.signal.aborted) return reject(new Error("aborted"));
+      init.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    }),
+  });
+  const call = dispatchTool({ name: "web_search", input: { query: "x" },
+    ctx: { env: { EXA_API_KEY: "k" } }, signal: parent.signal, fetcher });
+  setTimeout(() => parent.abort(), 20);
+  const r = await call;   // settles only if the parent-abort link outlives the header phase
+  assert.match(r.error, /request failed/);
+});

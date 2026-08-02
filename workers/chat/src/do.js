@@ -45,7 +45,9 @@ const SCHEMA = [
 
 const HISTORY_REPLAY_LIMIT = 50;
 
-const READ_ONLY_TOOLS = new Set(["read_file", "list_files", "tail_logs"]);
+const READ_ONLY_TOOLS = new Set(["read_file", "list_files", "tail_logs", "web_search", "web_fetch"]);
+// Tools that never touch the MicroVM — a batch of only these must not boot (or wait on) one.
+const SANDBOXLESS_TOOLS = new Set(["web_search", "web_fetch"]);
 // Safe to re-run on a redispatch: read-only tools + write_file (idempotent — same path+content).
 // Everything else (run_command / deploy_test / call_preview) can have non-idempotent side effects.
 const REPLAY_SAFE_TOOLS = new Set([...READ_ONLY_TOOLS, "write_file"]);
@@ -566,7 +568,7 @@ export class ChatSessionDO extends DurableObject {
 
     // On failure synthesize an error tool_result per tool_use so the API contract holds.
     try {
-      await this._ensureSandbox();
+      if (toolUses.some(tu => !SANDBOXLESS_TOOLS.has(tu.name))) await this._ensureSandbox();
     } catch (err) {
       console.warn(`sandbox open failed: ${errMessage(err)}`);
       const results = toolUses.map(tu => toolResultBlock(tu.id, { error: "sandbox unavailable" }, true));
