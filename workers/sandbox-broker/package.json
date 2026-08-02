@@ -8,8 +8,5 @@
   },
   "dependencies": {
     "@wdl-dev/aws-sigv4": "^3.0.0"
-  },
-  "devDependencies": {
-    "wrangler": "^4"
   }
 }

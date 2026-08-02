@@ -23,6 +23,9 @@
     "deploy:frontend": "cd workers/frontend && wdl deploy . --ns demo && cd ../.. && scripts/prune-versions.sh chat --ns demo && scripts/prune-versions.sh chat-worker --ns demo && scripts/prune-versions.sh sandbox-broker --ns demo",
     "bootstrap": "node scripts/bootstrap.js"
   },
+  "devDependencies": {
+    "@wdl-dev/cli": "1.6.1"
+  },
   "engines": {
     "node": ">=24"
   }
