@@ -9,8 +9,10 @@ namespace via `deploy_test`, and shows a preview iframe. This project is just a 
 the platform — it deploys to the regular `demo` ns and uses the open-source CLI
 (`@wdl-dev/cli`, github.com/wdl-dev/cli) like any other tenant. The platform repo
 ([wdl-dev/wdl](https://github.com/wdl-dev/wdl); its docs are the platform-mechanics
-source of truth — re-read them rather than duplicating here) runs the control plane at
-**api.wdl.dev**, serves tenant workers at **\*.wdl.sh**, and this app at **chat.wdl.dev**.
+source of truth — re-read them rather than duplicating here; all org docs are also aggregated
+at **wdl.md**, where appending `.md` to any page returns the markdown source) runs the control
+plane at **api.wdl.dev**, serves tenant workers at **\*.wdl.sh**, and this app at
+**chat.wdl.dev**. The public site is **wdl.dev**.
 
 ## Architecture
 
@@ -131,9 +133,12 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
 ## Secrets (`--ns demo`)
 
 - chat-worker: `TOKEN_ISSUER_TOKEN` (narrow token-issuer credential — mints per-session ns
-  tokens), `OPERATOR_TOKEN` (operator `/admin/*` endpoints), `LLM_API_KEY` (the
-  DeepSeek key), `ADMIN_URL` (`https://api.wdl.dev`), `DEMO_PASSCODE`
-  (portal gate).
+  tokens), `OPERATOR_TOKEN` (operator `/admin/*` endpoints), `LLM_API_KEY` (the LLM provider
+  key), `ADMIN_URL` (`https://api.wdl.dev`), `DEMO_PASSCODE` (portal gate); plus the optional
+  `LLM_*` overrides (`LLM_API_SHAPE` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_MODEL_LITE` /
+  `LLM_MAX_TOKENS` / `LLM_MAX_TOKENS_PARAM` / `LLM_BUDGET_MS` / `LLM_REASONING_EFFORT`) — these pin
+  the live provider; see the LLM design decision for the current pick and its constraints
+  (`LLM_MAX_TOKENS_PARAM=max_completion_tokens` is required for OpenAI reasoning models).
 - sandbox-broker: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (the broker's IAM user),
   `MICROVM_IMAGE_ARN` (the MicroVM image ARN — a secret so the account id isn't committed).
   Secrets are per ns+worker and write-only — renaming the worker requires re-putting them.
@@ -184,9 +189,13 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   **transcript is the commit record** — a re-dispatch that lands after the assistant reply /
   tool_results were already recorded replays the derived outcome instead of re-running
   (`replayLlmTurnOutcome` / `replayPlanOutcome` / `toolBatchAlreadyRan`); the tool batch is
-  also **per-tool resumable**, keyed by the `tool_use` id journaled on each step
-  (`_completedToolResults`), so a mid-batch re-dispatch doesn't re-run a completed tool's side
-  effects. (2) **in-flight coalescing** (`_llmTurnInFlight` / `_toolBatchInFlight` / …) only
+  also **per-tool resumable**, keyed by the `tool_use` id **plus the assistant turn's `seq`**
+  journaled on each step (`_completedToolResults` / `sameBatch`), so a mid-batch re-dispatch doesn't
+  re-run a completed tool's side effects — while a provider that reuses ids like `call_0` across turns
+  can't make a later batch inherit an earlier result. Matching is strict equality, so a step journaled before
+  `batchSeq` existed matches nothing and its tool re-runs. That is reachable only for a run in flight
+  across the one deploy that introduced the field — every step journaled since carries it — so the
+  window is closed rather than defended in code. (2) **in-flight coalescing** (`_llmTurnInFlight` / `_toolBatchInFlight` / …) only
   dedups temporally-overlapping dispatches — it can't cover a sequential re-dispatch, which
   is why layer (1) exists. Plan-revise idempotency is **attempt-scoped**
   (`reviseAttemptDone:<runId>`), not text-keyed — the same note on two attempts must both run.
@@ -212,15 +221,22 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   `/opt/wdl-cli` bin so the sandbox uid hits EPERM; pnpm uses its own bin-shim model and
   skips that chmod. Allowing both also causes lock-file conflicts. `blockedCommandError`
   returns `{error, hint}` before any request reaches the VM.
-- **`run_command` blocks bypass-deploy paths.** `blockedCommandError` rejects direct
-  `wdl deploy|pack|tail` and `(pnpm|npm|yarn) [run] deploy[:variant]` (the npm-script
-  wrappers `wdl init` scaffolds); `checkWranglerDeploy` rejects `wrangler deploy` unless
-  it is a single `--dry-run` invocation (wrangler ships to wherever it is logged in, not
-  our control plane). Plus `stripDeployScripts` deletes `deploy` / `deploy:*` from
-  package.json after every `wdl init`. Detection is a shell-aware parser
-  (`splitTopLevelOps` + `tokenizeShellArgs` + `commandArgvs`) that scans every argv
-  position and descends into `bash -c` bodies and `$(...)` / backtick substitutions —
-  not ad-hoc regex. It is robust but a guard, not a security boundary (that is the VM + uid).
+- **`run_command` blocks bypass-deploy paths — a best-effort UX steer, deliberately not airtight.**
+  `blockedCommandError` rejects direct `wdl deploy|pack|tail` and `(pnpm|npm|yarn) [run]
+  deploy[:variant]` (the npm-script wrappers `wdl init` scaffolds); `checkWranglerDeploy` rejects
+  `wrangler deploy` unless it is a single `--dry-run` invocation. Plus `stripDeployScripts` deletes
+  `deploy` / `deploy:*` from package.json after every `wdl init`. Detection is a shell-aware parser
+  (`splitTopLevelOps` + `tokenizeShellArgs` + `commandArgvs`) that peels a leading `sudo` / `VAR=`
+  assignment and package-runner wrappers (`npx` / `pnpm|yarn exec|dlx` / `bunx`), descends into
+  `bash -c` bodies and `$(...)` / backtick substitutions, and checks argv[0]/subcommand — not ad-hoc
+  regex. **It only catches the obvious forms an LLM actually emits.** It intentionally does NOT chase
+  exotic variants — other launcher wrappers (`env`/`nice`/`setsid` prefixes), per-flag arity, npm
+  aliases (`in`, `it`, `run-script`), package-manager global flags before the subcommand, or `-c`
+  command bodies. Those slip through, and that is fine: **this is not a security boundary (the VM +
+  uid is), and its only real job is steering the model off `npm install` (which chmod-breaks
+  `/opt/wdl-cli`) and off the wrong deploy path — a slipped command still can't escape the VM.** Do
+  not re-grow per-flag arity tables / alias normalization to close corner cases; that was tried and
+  reverted (net-negative — the pile-up still had corner cases and read as complete when it wasn't).
 - **sandbox-agent command lock is bounded.** `makeKeyedRwLock(acquireTimeoutMs)` returns 503
   ("sandbox busy") if a caller waits too long for the lock, so one slow `/run` can't
   strand every queued op. Read-only `/read-file` / `/list-files` take the read side — they
@@ -228,19 +244,89 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
 - **One worker name per session: `app`.** Deploy hardcodes `FIXED_WORKER_NAME = "app"`;
   preview URL is always `https://<ns>.wdl.sh/app/`. Gives tenants a predictable ns surface
   and lets `call_preview` / `wdl tail` work without name plumbing.
-- **LLM is DeepSeek V4 over the Anthropic-compatible API**, not Anthropic direct. Base URL
-  `https://api.deepseek.com/anthropic`, header `x-api-key`. No prompt caching, supports
-  `thinking` blocks. `LLM_API_KEY` holds the DeepSeek key (Anthropic-compatible API).
-- **Per-call model selection (Pro + Flash mixed).** `pickModel` picks `LLM_MODEL` (default
-  `deepseek-v4-pro`) when the last message is intent-bearing user text, and `LLM_MODEL_LITE`
-  (default `deepseek-v4-flash`) for tool_result-only continuations. Both env-overridable.
+- **Supported models: DeepSeek V4, Qwen 3.7, Grok 4.5 — nothing else.** Code defaults to
+  `deepseek-v4-pro` / `deepseek-v4-flash` on the Anthropic shape; the live provider is whatever the
+  `LLM_*` secrets say — the secrets are the source of truth, this file only records the rationale.
+  As of 2026-08-01 that is `deepseek-v4-flash` (the GA rebuild) over its OpenAI endpoint
+  (`LLM_API_SHAPE=openai`, `LLM_BASE_URL=https://api.deepseek.com`) with **`LLM_REASONING_EFFORT=low`,
+  which is mandatory there** — unset, the model spends the whole 90s budget thinking and every open-ended
+  run dies. `grok-4.5` (xAI direct, effort=low; 4/4 on `npm run bench`) and `qwen3.7-max` (Aliyun
+  gateway, Anthropic shape) are the vetted alternates.
+  Others were measured and dropped — Kimi K3 (~3× slower), GLM-5.2 (spends the whole budget
+  thinking), Doubao Seed 2.1 (a single call ran 302s) — see the LLM-provider memory for the numbers
+  before re-testing any of them. The Anthropic shape sends `x-api-key` only (a stray `Authorization`
+  401s some endpoints); the OpenAI shape sends `Authorization: Bearer` only. Never add
+  temperature/top_p.
+- **Both wire shapes are supported; Anthropic is canonical.** The DO pipeline (storage, replay,
+  `_buildLlmMessages`, the UI stream) speaks Anthropic content blocks everywhere;
+  `LLM_API_SHAPE=openai` (missing / empty / exactly `anthropic` → Anthropic; any other non-empty value
+  throws — a typo must not silently ship the key to the wrong provider) makes `llm.js` convert at
+  the provider boundary via `llm-openai.js` — request (`system` role message, `tool_result` →
+  `role:"tool"`, thinking → `reasoning_content`, tools → function wrappers), response, and SSE
+  (`data:`-only frames, `[DONE]` ends consumption without waiting for HTTP EOF, incremental
+  `tool_calls` argument JSON) all map back to the same
+  Anthropic result shape, so callers can't tell which wire was used. Default base URL flips with
+  the shape (`https://api.deepseek.com`); auth is Bearer-only on the OpenAI shape. The token-cap
+  field is provider-specific (`LLM_MAX_TOKENS_PARAM`, default `max_tokens`): DeepSeek **silently
+  ignores** `max_completion_tokens` and honors only `max_tokens`, while OpenAI reasoning models
+  reject `max_tokens` — so the default is `max_tokens` (correct for all three supported models).
+  Streaming asks for `stream_options:{include_usage:true}` so spec-standard OpenAI still returns a
+  usage frame, and both consumers stop at their terminator (`[DONE]` / `message_stop`) rather than
+  waiting for HTTP EOF — otherwise a provider that holds the connection open burns the whole
+  `LLM_BUDGET_MS`. A stream that ends without one throws instead of recording a partial turn as
+  finished. `LLM_REASONING_EFFORT` maps to `reasoning_effort` (OpenAI shape) but nested
+  `output_config.effort` (Anthropic shape — the top-level field is OpenAI-only). `tool_result.is_error`
+  has no OpenAI equivalent and is dropped: tool error payloads are self-describing JSON. stop_reason
+  mapping: `stop→end_turn`, `tool_calls→tool_use`, `length→max_tokens`, unknown values pass through.
+  Thinking is replayed verbatim on both wires, signed or not — see the signature bullet below for why
+  filtering is not an option here. Verified live against DeepSeek V4, Qwen 3.7 and Grok 4.5 on both
+  shapes, plus OpenAI gpt-5.4 before it was region-blocked.
+- **`finalizeResponse` is the one gate every response passes** (`llm-sse.js`), whichever of the four
+  paths produced it. It checks only what the DO state machine depends on — a stop_reason, an id on
+  each tool_use (tool_results are matched by id), and something displayable. It deliberately does not
+  cross-check tool_use against `stop_reason`: a token cap landing right after a tool_use block closes
+  yields `max_tokens` with a complete call, which is legitimate and which the run loop handles. It is
+  **not** a protocol-conformance check: malformed provider output fails the run on its own, and an
+  earlier attempt to validate every way a provider could violate its spec never converged (each new
+  rule interacted with the last and introduced its own holes) while never once firing against a real
+  provider. Keep new checks to invariants the DO genuinely needs.
+- **Per-call model selection.** `pickModel` picks `LLM_MODEL` when the last message is
+  intent-bearing user text, and `LLM_MODEL_LITE` for tool_result-only continuations. Code
+  defaults are `deepseek-v4-pro` / `-flash`; either tier is a secret change, no code.
 - **LLM responses stream to the UI.** `callLlmMessages` accepts an `onDelta` callback that
   flips `stream:true` and consumes the Anthropic SSE format; do.js wires it to a
   `message.assistant_streaming` broadcast. Final response shape is identical to the
   non-streaming path. The SSE consumer normalizes CRLF on the whole buffer (chunk
   boundaries can split `\r\n`).
+- **A cut-short turn is salvaged, not discarded.** The LLM budget is our own deadline, so when it
+  fires (`signal.reason === "llm_timeout"`) the stream consumers hand back what already arrived —
+  text/thinking plus every tool call whose arguments actually closed; a half-streamed call — including
+  one with zero argument bytes yet — is dropped rather than dispatched with junk. If a call survives,
+  `stop_reason` becomes `tool_use` and the run continues; if only text survives it becomes
+  `max_tokens` and the run ends done with the partial answer visible (same as a provider cap). A user
+  Stop/Close carries a different reason and still discards, which is what they asked for.
+  `_runLlmStep` then clears the deadline's own `cancel_reason = 'llm_timeout'` (scoped — a user Stop
+  writes its own reason, so it never matches and always wins).
+- **The run loop branches on content, not `stop_reason`.** A turn truncated by the token cap still
+  carries finished tool calls; ending the run there reported a half-done job as success (observed on
+  DeepSeek@2500 and glm-5.2@3000 — both silently stopped before ever deploying). The loop now stops
+  only when the model has no tool call left to run. A turn with neither a tool call nor text — the
+  whole budget spent thinking, which glm-5.2 does reliably — ends the run **failed** with a visible
+  message rather than a green "done" over a blank reply.
+- **Providers split into "max_tokens bounds reasoning" and "it doesn't", and that is a property of the
+  (gateway, model) pair, not the model.** Measured 2026-07-31 with `max_tokens=200`: DeepSeek v4
+  pro/flash return exactly 201 on all three gateways (official / Aliyun / Volcano) — a real ceiling on
+  turn duration. `glm-5.2` bounds on Aliyun (201) but **not** on Volcano (`glm-5-2-260617` → 2152).
+  Qwen 3.7 overshoots ~12x, Grok ignores the cap entirely, Doubao Seed 2.1 pro returned 10888 tokens in
+  302s. Never infer this from a model name — measure the pair. On unbounded models `LLM_MAX_TOKENS` is
+  not a duration knob and only salvage keeps them usable.
+- **`LLM_MAX_TOKENS_PARAM` has exactly two valid values** (`max_tokens`, `max_completion_tokens`)
+  **and `resolveLlmConfig` throws on anything else.** Chat Completions *accepts and silently ignores*
+  unknown cap fields (measured with `max_output_tokens`, the Responses-API name), so the provider
+  would never surface the typo and the cap would go unenforced with nothing to diagnose. Same trap as
+  xAI's Anthropic endpoint accepting `thinking.budget_tokens` and ignoring it.
 - **180s LLM budget + 16k max_tokens, both env-tunable.** `LLM_BUDGET_MS` bounds the
-  AbortController + `setTimeout` around the DeepSeek fetch (set well under the Workflows
+  AbortController + `setTimeout` around the LLM fetch (set well under the Workflows
   step forward-timeout in production secrets). `LLM_MAX_TOKENS` caps output. The same abort
   controller is what `addUserMessage` (supersede) / `cancelLatestRun` (Stop) /
   `requestClose` (Close) abort, each with a distinct `signal.reason` that flows into
@@ -250,11 +336,17 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   is a read-side heal that scans assistant tool_use against the next user message's
   tool_result ids and synthesizes missing ones in-memory before the LLM call (storage stays
   as-is). This survives a Workflow step re-dispatch that committed an assistant message but
-  not the following tool_results. Skipping it yields a 400 from DeepSeek.
-- **DO NOT strip `thinking` blocks from history sent to DeepSeek V4 Pro.** DS V4 Pro returns
-  `400 "The content[].thinking in the thinking mode must be passed back to the API."` when
-  prior assistant turns are sent without their thinking blocks. `_buildLlmMessages` keeps
-  thinking intact.
+  not the following tool_results. Skipping it yields a 400 from the provider.
+- **DO NOT strip `thinking` blocks from history sent to the LLM.** Providers require the prior turns'
+  reasoning replayed as-is; DeepSeek V4 Pro answers a hard 400 without it, others degrade multi-step
+  continuity silently — the worse failure, because nothing surfaces the mistake. `_buildLlmMessages`
+  keeps thinking intact.
+- **None of our providers sign thinking blocks** (measured 2026-07-31 on the Anthropic wire:
+  DeepSeek, Qwen and Grok all return `signature: ""` and never send a `signature_delta`). So
+  signature-based handling is not an option here: filtering unsigned thinking out of replayed history
+  would strip every thinking block we ever get — the exact silent degradation the rule above forbids —
+  and rejecting unsigned thinking before running tools would fail every tool turn. Anthropic proper
+  does sign; gate either idea on the provider if that endpoint is ever used directly.
 - **Parallel read-only tool dispatch.** Contiguous read-only tool_uses (`read_file` /
   `list_files` / `tail_logs`, in `READ_ONLY_TOOLS`) run in a Promise.all batch with one
   shared AbortController. Effectful tools (`write_file` / `run_command` / `deploy_test` /
@@ -313,9 +405,18 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
 - **bootstrap.js stores a provided `TOKEN_ISSUER_TOKEN` by default; `--mint-issuer` mints a
   new one.** The DB step is idempotent. Each `--mint-issuer` run mints a fresh credential that
   stays live until you `auth.revoke` its tokenId. Per-session ns tokens self-expire on the template TTL.
-- **Anthropic-compatible DeepSeek rejects mismatched message ordering aggressively** — a
-  "tool_use without tool_result" error is fatal for the whole conversation. Every place that
-  appends a user message must keep tool_use/tool_result pairing intact.
+- **Anthropic-compatible providers reject mismatched message ordering aggressively** (observed
+  on DeepSeek; assume the same of the others) — a "tool_use without tool_result" error is fatal
+  for the whole conversation. Every place that appends a user message must keep
+  tool_use/tool_result pairing intact.
+- **A provider that works from your laptop can be geo-blocked from production.** chat-worker's
+  egress is the platform's ap-east-1 (Hong Kong) — OpenAI answers 403
+  `unsupported_country_region_territory` and the direct Gemini API 400
+  `User location is not supported` from there — and OpenRouter enforces the same block per model, so
+  routing around it does not help. DeepSeek, Qwen (Aliyun) and xAI all work. Verify a
+  candidate provider from the real egress before flipping secrets: deploy a throwaway worker in
+  the demo ns that forwards a request (key passed via request header, never stored) and delete
+  it after. Local curl success proves nothing about production.
 - **The LLM defaults to Cloudflare branding** unless told otherwise (wrangler + workerd =
   "Cloudflare Workers" in its prior). AGENTS.md has a "这不是 Cloudflare Workers" section; if
   generated output still leaks Cloudflare wording, strengthen AGENTS.md (the layer the AI

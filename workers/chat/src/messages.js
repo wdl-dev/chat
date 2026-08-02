@@ -1,4 +1,4 @@
-import { extractText, toolResultBlock } from "./lib.js";
+import { extractText, parseJson, toolResultBlock } from "./lib.js";
 
 const MISSING_REASON = "tool dispatch did not complete";
 const PRIOR_ELIDED = "[earlier tool output omitted to fit the context window]";
@@ -145,39 +145,44 @@ export function windowLlmMessages(raw, { stripTools = false, maxMessages = null 
   return coalesceRoles(healed);
 }
 
+// The answer axis, not the visibility axis: thinking renders (collapsed) but is not an answer.
+// Distinct from llm-sse's renderability check, which counts thinking because it still displays.
+export function hasAnswerContent(content) {
+  return (content ?? []).some(b =>
+    b?.type === "tool_use" || (b?.type === "text" && typeof b.text === "string" && b.text.trim() !== ""));
+}
+
 // Re-dispatch idempotency: replay the recorded assistant reply instead of re-calling the LLM; null = run it.
 export function replayLlmTurnOutcome(lastMessage, stopReason) {
   if (!lastMessage || lastMessage.role !== "assistant") return null;
-  let content;
-  try { content = JSON.parse(lastMessage.content); } catch { content = []; }
-  const hasToolUses = Array.isArray(content) && content.some(b => b?.type === "tool_use");
+  const content = parseJson(lastMessage.content);
+  const blocks = Array.isArray(content) ? content : [];
+  const hasToolUses = blocks.some(b => b?.type === "tool_use");
   // Persisted stop_reason keeps replay faithful (don't replay a truncated turn as tool_use).
   const sr = (typeof stopReason === "string" && stopReason.length > 0)
     ? stopReason
     : (hasToolUses ? "tool_use" : "end_turn");
+  // No hasOutput: replay stays faithful to what was recorded (a blank turn a previous version
+  // recorded as success must not flip the run to failed) — the empty-turn judgement is live-only.
   return { outcome: "done", stopReason: sr, hasToolUses };
 }
 
 // Plan replay: return the recorded plan instead of re-calling the plan LLM.
 export function replayPlanOutcome(lastMessage) {
   if (!lastMessage || lastMessage.role !== "assistant") return null;
-  let content;
-  try { content = JSON.parse(lastMessage.content); } catch { content = []; }
-  return { outcome: "done", plan: extractText(content) };
+  return { outcome: "done", plan: extractText(parseJson(lastMessage.content) ?? []) };
 }
 
 // Batch already ran if the last turn carries tool_results — don't re-execute (side effects).
 export function toolBatchAlreadyRan(lastMessage) {
   if (!lastMessage || lastMessage.role !== "user") return false;
-  let content;
-  try { content = JSON.parse(lastMessage.content); } catch { return false; }
+  const content = parseJson(lastMessage.content);
   return Array.isArray(content) && content.some(b => b?.type === "tool_result");
 }
 
 // Idempotency anchor for plan-revise/approve: a user turn carrying exactly this text.
 export function isUserTextTurn(row, text) {
   if (!row || row.role !== "user") return false;
-  let content;
-  try { content = JSON.parse(row.content); } catch { return false; }
+  const content = parseJson(row.content);
   return Array.isArray(content) && content.length === 1 && content[0]?.type === "text" && content[0]?.text === text;
 }

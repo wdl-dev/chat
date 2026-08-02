@@ -37,7 +37,7 @@ ${WDL_MARK}
       </form>
       <p id="portal-error" class="portal-error"></p>
     </div>
-    <p class="portal-foot" data-i18n="portal.foot">chat.wdl.dev · sessions are isolated and unrecoverable once closed</p>
+    <p class="portal-foot"><span data-i18n="portal.foot">chat.wdl.dev · sessions are isolated and unrecoverable once closed</span> · <a class="portal-foot-link" href="https://wdl.dev/" target="_blank" rel="noopener">Powered by WDL</a></p>
   </div>
 
   <!-- Chat view (session claimed, hidden until then). -->

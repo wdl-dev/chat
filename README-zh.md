@@ -4,7 +4,7 @@
 
 **一个构建 WDL Worker 的 WDL Worker。** wdl-chat 是一个 AI agent——它自己就部署在 WDL 上——把一句话变成运行中的 worker：MicroVM sandbox 编译 → 部署到临时 ns → 调试 + 预览。
 
-不是平台代码，是**跑在 WDL 平台上的 dogfooding 应用**（一个普通租户）。用开源 [`@wdl-dev/cli`](https://github.com/wdl-dev/cli) CLI（`npm i -g @wdl-dev/cli`），跟其他租户一样。平台本体见 [wdl-dev/wdl](https://github.com/wdl-dev/wdl)。线上：**https://chat.wdl.dev**。
+不是平台代码，是**跑在 WDL 平台上的 dogfooding 应用**（一个普通租户）。用开源 [`@wdl-dev/cli`](https://github.com/wdl-dev/cli) CLI（`npm i -g @wdl-dev/cli`），跟其他租户一样。平台本体见 [wdl-dev/wdl](https://github.com/wdl-dev/wdl)——主站 [wdl.dev](https://wdl.dev/)，[wdl-dev](https://github.com/wdl-dev) 全部仓库的文档聚合在 [wdl.md](https://wdl.md/)。线上：**https://chat.wdl.dev**。
 
 > **定位 —— 参考 demo，不是生产级加固服务。** 这是"在 WDL 上做一个真实应用"的尽力而为示范——一次规模极大的 dogfooding，并会一直停留在这个阶段：已部署、能用，但按 demo 维护——单测覆盖核心逻辑（解析、运行状态机、命令守卫、幂等）而非追求穷尽，Durable Object 与 VM 内 HTTP handler 没有直接测试 harness，少数边角以"已知限制"记录而非逐一修复。已知安全边界在设计文档里有明确描述。适合作为了解各组成部分的参考，别当作可直接投产的模板。
 
@@ -19,10 +19,11 @@ workers/
   sandbox-broker/     demo ns;无状态 RPC broker(open/mint/close 单 session
                       Lambda MicroVM),是唯一持 AWS key 的组件
   chat/               demo ns;chat-worker — ChatSessionDO + ChatRunWorkflow
-                      agent loop + LLM(DeepSeek)
+                      agent loop + LLM(Anthropic/OpenAI 双协议形状,secret 可配)
   frontend/           demo ns(worker name=chat);单页前端(WebSocket 优先、SSE 兜底),serve chat.wdl.dev
 docker/Dockerfile.microvm   MicroVM 镜像定义(由 AWS Lambda 构建,非本地 docker)
-scripts/              bootstrap、deploy-workers、build-agents-md、build-microvm-image
+scripts/              bootstrap、deploy-workers、build-agents-md、build-microvm-image、
+                      prune-versions
 tests/e2e/            联机 e2e(单测在各 worker 旁边)
 ```
 
@@ -56,6 +57,9 @@ MicroVM 的公网 HTTPS endpoint（带 `X-aws-proxy-auth`）跑命令 / 部署�
    echo -n <arn> | wdl secret put MICROVM_IMAGE_ARN --worker sandbox-broker --ns demo
 3. 设 chat-worker secrets(--worker chat-worker --ns demo):
    OPERATOR_TOKEN / LLM_API_KEY / ADMIN_URL / DEMO_PASSCODE  (TOKEN_ISSUER_TOKEN 已在步骤 1 由 bootstrap 设置)
+   # LLM_API_KEY 必须匹配默认 provider(DeepSeek,Anthropic 线)。换 provider 要整组一起设:
+   # LLM_API_SHAPE / LLM_BASE_URL / LLM_MODEL / LLM_MODEL_LITE(OpenAI reasoning 模型还要
+   # LLM_MAX_TOKENS_PARAM=max_completion_tokens,默认 max_tokens 会被它们 400)。只设 key 会被发往 DeepSeek。
 4. bash scripts/deploy-workers.sh    # 部署 chat-worker 然后 frontend(re-pin CHAT binding)
 5. 访问 https://chat.wdl.dev/
 ```

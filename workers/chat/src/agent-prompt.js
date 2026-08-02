@@ -32,6 +32,7 @@ export const TOOL_DEFINITIONS = [
       properties: {
         path: { type: "string", description: "Directory path under /workspace. Defaults to /workspace." },
       },
+      required: [],
     },
   },
   {
@@ -56,6 +57,7 @@ export const TOOL_DEFINITIONS = [
     input_schema: {
       type: "object",
       properties: {},
+      required: [],
     },
   },
   {
@@ -71,6 +73,7 @@ export const TOOL_DEFINITIONS = [
         body:         { type: ["string", "object", "null"], description: "Request body. JSON-encoded if object." },
         capture_logs: { type: "boolean", description: "Default true. When true, opens a tail before the request and returns logs[] alongside the response. When false, skips tail (~2s faster)." },
       },
+      required: [],
     },
   },
   {
@@ -85,6 +88,7 @@ export const TOOL_DEFINITIONS = [
         maxEvents:   { type: "integer", minimum: 1, maximum: 200 },
         maxBytes:    { type: "integer", minimum: 1, maximum: 200000 },
       },
+      required: [],
     },
   },
 ];

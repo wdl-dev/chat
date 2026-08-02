@@ -90,6 +90,7 @@ const STRINGS = {
     "tool.read_file": "read", "tool.write_file": "write", "tool.list_files": "list",
     "tool.run_command": "run", "tool.deploy_test": "deploy", "tool.call_preview": "preview", "tool.tail_logs": "logs",
     "ui.thinking": "Thinking",
+    "ui.thinkingLive": (s) => `Thinking ${s}s`,
     "plan.headerRevised": "Plan (revised) — please confirm again",
     "plan.header": "Plan — please confirm",
     "plan.notePlaceholder": "Adjust the plan, or answer its questions… (≤ 5000 chars)",
@@ -159,6 +160,7 @@ const STRINGS = {
     "tool.read_file": "读取", "tool.write_file": "写入", "tool.list_files": "列目录",
     "tool.run_command": "执行", "tool.deploy_test": "部署", "tool.call_preview": "预览", "tool.tail_logs": "日志",
     "ui.thinking": "思考",
+    "ui.thinkingLive": (s) => `思考中 ${s}s`,
     "plan.headerRevised": "Plan（已修订）— 请再次确认",
     "plan.header": "Plan — 请确认",
     "plan.notePlaceholder": "调整 plan，或回答 plan 里的提问…（5000 字以内）",
@@ -244,7 +246,7 @@ let lastStoppingNote = null;
 const renderedMessageSeqs = new Set();
 
 const SSE_EVENTS = [
-  "message.user", "message.assistant", "message.assistant_streaming",
+  "message.user", "message.assistant", "message.assistant_streaming", "message.tool_pending", "message.thinking",
   "history.done",
   "run.scheduled", "run.done", "run.aborted", "run.failed", "run.cancelRequested",
   "preview.ready", "session.closed",
@@ -434,13 +436,89 @@ function queueStreamingRender() {
 }
 
 function appendStreamingDelta(blockIndex, delta) {
+  settleThinkingRow();
   // must run before mutating the map: it resets streamingBlocks on first run
   ensureStreamingPlaceholder();
   streamingBlocks.set(blockIndex, (streamingBlocks.get(blockIndex) ?? "") + delta);
   queueStreamingRender();
 }
 
+let thinkingRow = null;
+let thinkingTimer = null;
+
+// Shows only that reasoning is running, plus elapsed seconds — the content renders collapsed when the
+// turn commits. Without it a long reasoning stretch is indistinguishable from a hang.
+function startThinkingRow(startedAt) {
+  if (thinkingTimer) return;   // already live — the server rebroadcasts every few seconds
+  if (!thinkingRow || !thinkingRow.isConnected) {
+    thinkingRow = document.createElement("div");
+    thinkingRow.className = "act-line";
+    const span = document.createElement("span");
+    span.className = "act-k";
+    thinkingRow.appendChild(span);
+    ensureAgentBody().appendChild(thinkingRow);
+  }
+  // Re-arm a settled row too: interleaved reasoning (thinking → text → thinking) pulses again.
+  thinkingRow.classList.add("pending");
+  const k = thinkingRow.firstChild;
+  const started = Number.isFinite(startedAt) ? startedAt : Date.now();
+  const tick = () => { k.textContent = tr("ui.thinkingLive", Math.max(0, Math.round((Date.now() - started) / 1000))); };
+  tick();
+  thinkingTimer = setInterval(tick, 1000);
+  scrollMsgs();
+}
+
+// Reasoning is over once anything else streams; keep the row (the elapsed time is useful) but stop it
+// pulsing, so only one thing on screen looks live at a time.
+function settleThinkingRow() {
+  if (thinkingTimer) { clearInterval(thinkingTimer); thinkingTimer = null; }
+  if (thinkingRow) thinkingRow.classList.remove("pending");
+}
+
+function clearThinkingRow() {
+  settleThinkingRow();
+  thinkingRow?.remove();
+  thinkingRow = null;
+}
+
+let pendingToolsEl = null;
+const pendingTools = new Map();   // blockIndex → { k, v } of a not-yet-committed tool row
+
+function renderPendingTool(blockIndex, { name, path, bytes = 0 }) {
+  settleThinkingRow();
+  if (!pendingToolsEl || !pendingToolsEl.isConnected) {
+    pendingToolsEl = document.createElement("div");
+    ensureAgentBody().appendChild(pendingToolsEl);
+  }
+  let ent = pendingTools.get(blockIndex);
+  if (!ent) {
+    const row = document.createElement("div");
+    row.className = "act-line pending";
+    const k = document.createElement("span");
+    k.className = "act-k";
+    const v = document.createElement("span");
+    v.className = "act-v";
+    row.append(k, v);
+    pendingToolsEl.appendChild(row);
+    ent = { k, v };
+    pendingTools.set(blockIndex, ent);
+  }
+  if (name) ent.k.textContent = toolVerb(name);
+  if (path) ent.path = path;
+  const size = bytes > 0 ? `${(bytes / 1024).toFixed(1)} KB` : "";
+  ent.v.textContent = [ent.path, size].filter(Boolean).join(" · ") + "…";
+  scrollMsgs();
+}
+
+function clearPendingTools() {
+  pendingToolsEl?.remove();
+  pendingToolsEl = null;
+  pendingTools.clear();
+}
+
 function clearStreamingPlaceholder() {
+  clearThinkingRow();
+  clearPendingTools();
   if (streamingPlaceholder && streamingPlaceholder.parentElement) {
     streamingPlaceholder.parentElement.removeChild(streamingPlaceholder);
   }
@@ -765,6 +843,8 @@ function stopCountdown() {
 
 function endSessionUi(statusKey) {
   sessionClosed = true;
+  // The close path broadcasts no run terminal first, so live indicators are torn down here.
+  clearStreamingPlaceholder();
   stopCountdown();
   if (ws) { try { ws.close(1000, "session closed"); } catch { /* ignore */ } ws = null; }
   if (evtSource) { try { evtSource.close(); } catch { /* ignore */ } evtSource = null; }
@@ -886,6 +966,15 @@ function handleEvent(type, data) {
       if (!data?.replay && typeof data?.delta === "string") {
         appendStreamingDelta(data.blockIndex ?? 0, data.delta);
       }
+      break;
+    case "message.thinking":
+      if (staleRun(data)) break;
+      if (!data?.replay) startThinkingRow(data?.startedAt);
+      break;
+    case "message.tool_pending":
+      if (staleRun(data)) break;
+      // Superseded by the committed turn's real rows — renderAssistant clears these first.
+      if (!data?.replay) renderPendingTool(data?.blockIndex ?? 0, data ?? {});
       break;
     case "history.done":
       everConnected = true;

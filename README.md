@@ -13,7 +13,9 @@ This is **not** platform code — it's a dogfooding application that runs **as a
 tenant on the WDL platform**, the same way any other tenant would. It uses
 the open-source [`@wdl-dev/cli`](https://github.com/wdl-dev/cli) CLI
 (`npm i -g @wdl-dev/cli`); the platform itself is
-[wdl-dev/wdl](https://github.com/wdl-dev/wdl). Live at
+[wdl-dev/wdl](https://github.com/wdl-dev/wdl) — main site
+[wdl.dev](https://wdl.dev/), docs for every [wdl-dev](https://github.com/wdl-dev)
+repository aggregated at [wdl.md](https://wdl.md/). Live at
 **https://chat.wdl.dev**.
 
 > **Status — reference demo, not a hardened production service.** This is a
@@ -41,12 +43,13 @@ workers/
   sandbox-broker/     demo ns; stateless RPC broker (open/mint/close a per-session
                       Lambda MicroVM) — the only component holding the AWS key.
   chat/               demo ns; chat-worker — ChatSessionDO + ChatRunWorkflow
-                      agent loop + LLM (DeepSeek).
+                      agent loop + LLM (Anthropic- or OpenAI-shaped provider, secret-configurable).
   frontend/           demo ns (worker name = chat); single-page frontend (WebSocket-preferred, SSE fallback) that
                       serves chat.wdl.dev.
 docker/Dockerfile.microvm   MicroVM image definition (built by AWS Lambda, not
                             local docker).
-scripts/              bootstrap, deploy-workers, build-agents-md, build-microvm-image.
+scripts/              bootstrap, deploy-workers, build-agents-md, build-microvm-image,
+                      prune-versions.
 tests/e2e/            live-stack e2e (unit tests live beside each worker).
 ```
 
@@ -84,6 +87,10 @@ You need two credentials from your WDL platform operator: (1) a normal per-ns to
    echo -n <arn> | wdl secret put MICROVM_IMAGE_ARN --worker sandbox-broker --ns demo  # name-based ARN, see "built separately" below
 3. set chat-worker secrets (--worker chat-worker --ns demo):
    OPERATOR_TOKEN / LLM_API_KEY / ADMIN_URL / DEMO_PASSCODE   (TOKEN_ISSUER_TOKEN was set in step 1)
+   # LLM_API_KEY must match the default provider (DeepSeek, Anthropic wire). For a different
+   # provider set the whole LLM_* group together: LLM_API_SHAPE / LLM_BASE_URL / LLM_MODEL /
+   # LLM_MODEL_LITE (+ LLM_MAX_TOKENS_PARAM=max_completion_tokens for OpenAI reasoning models —
+   # the default max_tokens 400s them). A bare key with no overrides is sent to DeepSeek.
 4. bash scripts/deploy-workers.sh    # deploy chat-worker, then frontend (re-pins the CHAT binding)
 5. open https://chat.wdl.dev/
 ```

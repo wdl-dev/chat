@@ -1,6 +1,7 @@
 import {
   errMessage,
   httpError,
+  parseJson,
   jsonResponse,
   requireSecretEqual,
 } from "./lib.js";
@@ -42,8 +43,7 @@ async function mintDelegatedNsOnce(env, fetcher) {
     return { ok: false, status: 0, reason: "unreachable", detail: errMessage(err) };
   }
   const text = await res.text();
-  let data;
-  try { data = text ? JSON.parse(text) : {}; } catch { data = {}; }
+  const data = (text ? parseJson(text) : null) ?? {};
   if (!res.ok || typeof data?.token !== "string" || typeof data?.ns !== "string") {
     // `error` is the auth reason code; the rest of the body can carry a minted token, so never log it.
     return { ok: false, status: res.status, reason: typeof data?.error === "string" ? data.error : "" };

@@ -139,7 +139,7 @@ test("isRedispatchError matches the workflows-engine stale-claim errors, not rea
   // Survives wrapping (e.g. an HTTP envelope around the platform message).
   assert.equal(isRedispatchError(new Error("workflows 409: Workflow run claim does not match instance state")), true);
   // Genuine failures must still be settled as failed.
-  for (const m of ["DeepSeek 500: overloaded", "llm failed", "exceeded MAX_TURNS (128)", "boom"]) {
+  for (const m of ["LLM 500: overloaded", "llm failed", "exceeded MAX_TURNS (128)", "boom"]) {
     assert.equal(isRedispatchError(new Error(m)), false, m);
   }
   assert.equal(isRedispatchError(new TypeError("x is not a function")), false);
@@ -153,6 +153,24 @@ test("capText keeps head+tail with an elision marker when over the cap", () => {
   assert.ok(out.startsWith("H"), "keeps head");
   assert.ok(out.endsWith("T"), "keeps tail");
   assert.match(out, /truncated/);
+});
+
+test("capText never leaves a lone surrogate, whichever way the cut falls in a pair", () => {
+  // All-emoji so head/tail boundaries land mid-pair for the odd-index caps in this sweep — the
+  // buggy slice-only version leaves a lone surrogate at exactly those caps.
+  const big = "😀".repeat(200);
+  for (let cap = 40; cap <= 140; cap++) {
+    const out = capText(big, cap);
+    for (let i = 0; i < out.length; i++) {
+      const c = out.charCodeAt(i);
+      if (c >= 0xd800 && c <= 0xdbff) {
+        assert.ok(out.charCodeAt(i + 1) >= 0xdc00 && out.charCodeAt(i + 1) <= 0xdfff, `lone high surrogate at ${i}, cap=${cap}`);
+      }
+      if (c >= 0xdc00 && c <= 0xdfff) {
+        assert.ok(i > 0 && out.charCodeAt(i - 1) >= 0xd800 && out.charCodeAt(i - 1) <= 0xdbff, `lone low surrogate at ${i}, cap=${cap}`);
+      }
+    }
+  }
 });
 
 test("toolResultBlock caps oversized content", () => {

@@ -77,10 +77,10 @@ test("an aborted LLM turn ends aborted", async () => {
 
 test("a failed LLM turn ends failed with the error", async () => {
   const { step } = makeStep();
-  const { sd, ends } = makeSd({ llm: { outcome: "failed", error: "deepseek 500" } });
+  const { sd, ends } = makeSd({ llm: { outcome: "failed", error: "llm 500" } });
   const out = await runChatRun(step, sd, free);
-  assert.deepEqual(out, { runId: "r1", outcome: "failed", error: "deepseek 500" });
-  assert.deepEqual(ends, [{ runId: "r1", status: "failed", error: "deepseek 500" }]);
+  assert.deepEqual(out, { runId: "r1", outcome: "failed", error: "llm 500" });
+  assert.deepEqual(ends, [{ runId: "r1", status: "failed", error: "llm 500" }]);
 });
 
 test("a tool_use turn runs the batch, then the next turn ends done", async () => {
@@ -231,4 +231,36 @@ test("plan-confirmed: a cancel that wakes the plan wait ends aborted, not 'inval
   assert.deepEqual(await runChatRun(step, sd, plan), { runId: "r1", outcome: "aborted" });
   assert.ok(ends.some(e => e.status === "aborted"), "settles aborted");
   assert.ok(!ends.some(e => e.status === "failed"), "must not fail on the wake decision");
+});
+
+test("a max_tokens turn that still carries tool calls dispatches the batch instead of ending", async () => {
+  const { step } = makeStep();
+  const { sd, ends, calls } = makeSd({
+    llm: [
+      { outcome: "done", stopReason: "max_tokens", hasToolUses: true, hasOutput: true },
+      { outcome: "done", stopReason: "end_turn", hasToolUses: false, hasOutput: true },
+    ],
+  });
+  const r = await runChatRun(step, sd, free);
+  assert.equal(r.outcome, "done");
+  assert.ok(calls.includes("tools"), "the salvaged/truncated batch must run");
+  assert.deepEqual(ends, [{ runId: "r1", status: "done", stopReason: "end_turn" }]);
+});
+
+test("a turn with neither tool calls nor text ends the run failed, not done", async () => {
+  const { step } = makeStep();
+  const { sd, ends } = makeSd({ llm: { outcome: "done", stopReason: "end_turn", hasToolUses: false, hasOutput: false } });
+  const r = await runChatRun(step, sd, free);
+  assert.equal(r.outcome, "failed");
+  assert.equal(ends.length, 1);
+  assert.equal(ends[0].status, "failed");
+  assert.match(ends[0].error, /no answer/);
+});
+
+test("an old DO facet omitting hasOutput keeps the pre-field behaviour (done, not failed)", async () => {
+  const { step } = makeStep();
+  const { sd, ends } = makeSd({ llm: { outcome: "done", stopReason: "end_turn", hasToolUses: false } });
+  const r = await runChatRun(step, sd, free);
+  assert.equal(r.outcome, "done");
+  assert.deepEqual(ends, [{ runId: "r1", status: "done", stopReason: "end_turn" }]);
 });

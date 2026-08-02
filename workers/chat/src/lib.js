@@ -38,11 +38,27 @@ export function sseEvent(event, data) {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
+// For stored-JSON reads whose absence is handled, not fatal; sites needing a different fallback
+// keep their own try/catch.
+export function parseJson(s) {
+  try { return JSON.parse(s); } catch { return null; }
+}
+
 export function newRunId() {
   return crypto.randomUUID();
 }
 
 const TOOL_RESULT_CAP = 256 * 1024;
+
+// A cut through a surrogate pair leaves a lone half that encodes to U+FFFD on the wire.
+const dropTrailingLoneSurrogate = (s) => {
+  const c = s.charCodeAt(s.length - 1);
+  return c >= 0xd800 && c <= 0xdbff ? s.slice(0, -1) : s;
+};
+const dropLeadingLoneSurrogate = (s) => {
+  const c = s.charCodeAt(0);
+  return c >= 0xdc00 && c <= 0xdfff ? s.slice(1) : s;
+};
 
 // Cap a tool_result's serialized content (head+tail, elision marker) to keep it within model context.
 export function capText(s, cap = TOOL_RESULT_CAP) {
@@ -50,7 +66,9 @@ export function capText(s, cap = TOOL_RESULT_CAP) {
   const marker = `\n…[${s.length - cap} chars truncated]…\n`;
   const keep = Math.max(0, cap - marker.length);
   const head = Math.ceil(keep / 2);
-  return s.slice(0, head) + marker + s.slice(s.length - (keep - head));
+  const headStr = dropTrailingLoneSurrogate(s.slice(0, head));
+  const tailStr = dropLeadingLoneSurrogate(s.slice(s.length - (keep - head)));
+  return headStr + marker + tailStr;
 }
 
 // Anthropic tool_result block.

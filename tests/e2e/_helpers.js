@@ -1,5 +1,5 @@
 // Shared helpers for tests/e2e/* — the demos need a real running stack
-// (chat-frontend + chat-worker + sandbox-broker + MicroVM image + DeepSeek).
+// (chat-frontend + chat-worker + sandbox-broker + MicroVM image + LLM).
 //
 // Set WDL_CHAT_BASE_URL to e.g. https://chat.test-workers.example.com to
 // run them; otherwise the test files mark themselves skipped.

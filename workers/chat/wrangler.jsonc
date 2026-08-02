@@ -46,7 +46,8 @@
   //   TOKEN_ISSUER_TOKEN     - narrow token-issuer credential; mints per-session
   //                            tmp ns tokens via /auth/delegated-tokens
   //   OPERATOR_TOKEN         - operator endpoints (/admin/*)
-  //   LLM_API_KEY            - DeepSeek key (anthropic-compatible API)
+  //   LLM_API_KEY            - LLM provider key
+  //   LLM_API_SHAPE          - optional; "openai" switches the wire format (default anthropic)
   //   ADMIN_URL              - https://api.wdl.dev
   //   DEMO_PASSCODE          - gates POST /portal/start (the portal login)
 }

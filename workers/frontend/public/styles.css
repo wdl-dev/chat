@@ -154,6 +154,8 @@ button { font: inherit; cursor: pointer; border: 0; background: none; color: inh
   position: relative; z-index: 1; margin: 0;
   font-family: var(--mono); font-size: 0.72rem; color: var(--faint); opacity: 0.85;
 }
+.portal-foot-link { color: inherit; text-decoration: none; border-bottom: 1px solid var(--line); }
+.portal-foot-link:hover { color: var(--ink); border-bottom-color: currentColor; }
 
 /* ============================================================ Chat header */
 #chat-header {
@@ -268,6 +270,9 @@ body.has-preview #side {
 }
 .act-line .act-k { flex-shrink: 0; color: var(--muted); }
 .act-line .act-v { color: var(--faint); word-break: break-all; }
+/* A tool row shown while its arguments are still streaming; replaced by the committed turn's row. */
+.act-line.pending { animation: act-pulse 1.4s ease-in-out infinite; }
+@keyframes act-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
 /* Thinking — a single faint, ignorable toggle */
 .turn-body .think { margin: 0 0 0.5rem; }

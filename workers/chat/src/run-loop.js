@@ -55,7 +55,18 @@ async function runFreeForm(step, sd, runId, options = {}) {
     }
     stopReason = llm.stopReason ?? null;
 
-    if (stopReason !== "tool_use" || !llm.hasToolUses) {
+    // Content decides, not stop_reason: a turn cut short by the token cap (or by our own budget, then
+    // salvaged) still carries finished tool calls, and ending the run there reports a half-done job as
+    // success. The loop stops when the model has nothing left to run.
+    if (!llm.hasToolUses) {
+      // Strict false: a DO facet pinned to a version that predates this field omits it, and an
+      // absent signal must keep the old behaviour rather than fail the run.
+      if (llm.hasOutput === false) {
+        // Whole turn spent thinking — no tool call, no text. A green "done" here is a silent failure.
+        const error = "the model produced no answer this turn — please try again";
+        await step.do(`${endNamePrefix}end-empty-${turn}`, async () => sd.workflowEndRun({ runId, status: "failed", error }));
+        return { runId, outcome: "failed", error };
+      }
       await step.do(`${endNamePrefix}end-done-${turn}`, async () => sd.workflowEndRun({ runId, status: "done", stopReason }));
       return { runId, outcome: "done", stopReason };
     }

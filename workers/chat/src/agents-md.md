@@ -1,6 +1,6 @@
 # AGENTS.md (Sandbox)
 
-你在受限 Sandbox 里写 WDL Worker。这份文档跟系统提示一起约束动作。WDL 是自托管的多租户 Workers 运行时 + 控制面 —— 你写 Workers 形态的代码（wrangler 配置 + workerd 引擎），但跑在 Cloudflare 之外，部署、绑定、ACL 都是 WDL 自己的。WDL 由 WDL Team 开发、以 Apache-2.0 开源在 github.com/wdl-dev（介绍 / 署名平台时用这个，别提公司名）。
+你在受限 Sandbox 里写 WDL Worker。这份文档跟系统提示一起约束动作。WDL 是自托管的多租户 Workers 运行时 + 控制面 —— 你写 Workers 形态的代码（wrangler 配置 + workerd 引擎），但跑在 Cloudflare 之外，部署、绑定、ACL 都是 WDL 自己的。WDL 由 WDL Team 开发、以 Apache-2.0 开源在 github.com/wdl-dev；主站 wdl.dev，文档 wdl.md（介绍 / 署名平台用这些，别提公司名）。
 
 ## 工具速查
 
@@ -80,14 +80,14 @@ Sandbox 单租户，**没有** uat/production 切换。所有 binding 写**顶�
 
 加 `"env": { "uat": ... }` → 需要 `--env uat` 才能 deploy，sandbox 不传 → fail。`/opt/wdl-cli/docs/env-overrides.md` 是开发机用法，sandbox **不适用**。
 
-以下 Cloudflare 习惯字段**部署时会被拒**，别加：`observability`（新版 `wrangler init` 脚手架会生成它，删掉）、`limits`、`placement`、`workers_dev`、`pages_build_output_dir`、老式 `[site]`。
+以下 Cloudflare 习惯字段**部署时会被拒**，别加：`observability`（新版 `wrangler init` 脚手架会生成它，删掉）、`limits`、`placement`、`pages_build_output_dir`、老式 `[site]`。`workers_dev` 也别设——你的 app 始终跑在平台域名（`<ns>.wdl.sh/app/`）上，设 `workers_dev = false` 只会让部署失败。
 
 ### 6. 输出给用户不提 Cloudflare
 
 页面 footer、JSON 响应、邮件正文等用户可见的地方：
 
 - ❌ "Powered by Cloudflare Workers" / "Deployed on Cloudflare"
-- ✅ "Powered by WDL"（需署名 / 链接用 WDL Team、github.com/wdl-dev） / "部署在 WDL 平台上" / 干脆没 footer
+- ✅ "Powered by WDL"（需署名 / 链接用 wdl.dev 或 github.com/wdl-dev） / "部署在 WDL 平台上" / 干脆没 footer
 
 代码注释里说"Cloudflare 风格"OK，**用户面前**只能说 WDL。
 

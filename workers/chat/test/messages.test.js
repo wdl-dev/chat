@@ -194,6 +194,13 @@ test("replayLlmTurnOutcome replays a completed turn and skips one still pending"
   );
 });
 
+test("replayLlmTurnOutcome omits hasOutput — replay is faithful to the recorded turn", () => {
+  // A blank/thinking-only turn a previous version recorded as success must not replay as failed.
+  const r = replayLlmTurnOutcome({ role: "assistant", content: JSON.stringify([{ type: "thinking", thinking: "..." }]) });
+  assert.equal(r.hasToolUses, false);
+  assert.equal("hasOutput" in r, false);
+});
+
 test("toolBatchAlreadyRan is true only for a user turn carrying tool_result", () => {
   assert.equal(toolBatchAlreadyRan({ role: "user", content: JSON.stringify([toolResult("t1")]) }), true);
   assert.equal(toolBatchAlreadyRan({ role: "user", content: JSON.stringify([text("hi")]) }), false);

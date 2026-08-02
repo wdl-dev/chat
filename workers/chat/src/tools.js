@@ -1,6 +1,7 @@
 import SANDBOX_AGENTS_MD_ZH from "./agents-md.gen.js";
 import SANDBOX_AGENTS_MD_EN from "./agents-md.en.gen.js";
-import { errMessage } from "./lib.js";
+import { errMessage, parseJson } from "./lib.js";
+import { makeSseSplitter } from "./llm-sse.js";
 
 function sandboxAgentsMd(lang) {
   return lang === "zh" ? SANDBOX_AGENTS_MD_ZH : SANDBOX_AGENTS_MD_EN;
@@ -417,8 +418,7 @@ async function runCommand(ctx, input, signal, fetcher) {
 async function stripDeployScripts(ctx, signal, fetcher) {
   const data = await readFile(ctx, { path: "/workspace/package.json" }, signal, fetcher);
   if (typeof data?.content !== "string") return;
-  let pkg;
-  try { pkg = JSON.parse(data.content); } catch { return; }
+  const pkg = parseJson(data.content);
   if (!pkg || typeof pkg !== "object" || !pkg.scripts || typeof pkg.scripts !== "object") return;
   let mutated = false;
   for (const k of Object.keys(pkg.scripts)) {
@@ -475,7 +475,7 @@ async function deployTest(ctx, _input, signal, fetcher) {
       method: "POST", headers, body: JSON.stringify(body), signal: ctlSignal,
     });
     const text = await res.text();
-    let json = {}; try { json = text ? JSON.parse(text) : {}; } catch { /* non-JSON */ }
+    const json = (text ? parseJson(text) : null) ?? {};
     return { ok: res.ok, status: res.status, text, json };
   };
 
@@ -640,8 +640,7 @@ async function openTailCapture(ctx, parentSignal, fetcher) {
 function parseSseBlock(block) {
   let event = "message";
   const dataLines = [];
-  for (const raw of block.split("\n")) {
-    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+  for (const line of block.split("\n")) {
     if (line.startsWith(":")) continue;
     if (line.startsWith("event:")) event = line.slice(6).trim();
     else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
@@ -658,23 +657,23 @@ async function drainTailSse(reader, { maxEvents, maxBytes }) {
   let truncated = null;
   let readError = null;
   const decoder = new TextDecoder();
-  let buf = "";
+  const splitter = makeSseSplitter();
+  const take = (blocks) => {
+    for (const block of blocks) {
+      if (block.trim().length === 0) continue;
+      events.push(parseSseBlock(block));
+      if (events.length >= maxEvents) { truncated = "maxEvents"; return true; }
+    }
+    return false;
+  };
   while (true) {
     let chunk;
     try { chunk = await reader.read(); } catch (err) { readError = err; break; }
-    if (chunk.done) break;
+    if (chunk.done) { take(splitter.flush()); break; }
     const piece = decoder.decode(chunk.value, { stream: true });
-    buf += piece;
     bytes += piece.length;
-    let idx;
-    while ((idx = buf.indexOf("\n\n")) !== -1) {
-      const block = buf.slice(0, idx);
-      buf = buf.slice(idx + 2);
-      if (block.trim().length === 0) continue;
-      events.push(parseSseBlock(block));
-      if (events.length >= maxEvents) { truncated = "maxEvents"; return { events, bytes, truncated, readError }; }
-    }
-    if (bytes >= maxBytes) { truncated = "maxBytes"; return { events, bytes, truncated, readError }; }
+    if (take(splitter.push(piece))) break;
+    if (bytes >= maxBytes) { truncated = "maxBytes"; break; }
   }
   return { events, bytes, truncated, readError };
 }
@@ -733,4 +732,4 @@ export async function dispatchTool({ name, input, ctx, signal, fetcher = fetch, 
   return await handler(ctx, input, signal, fetcher, sleep);
 }
 
-export const __test__ = { parseSseBlock, clampInt, runsWdlInitCommand };
+export const __test__ = { parseSseBlock, drainTailSse, clampInt, runsWdlInitCommand };

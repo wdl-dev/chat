@@ -1,6 +1,6 @@
 # AGENTS.md (Sandbox)
 
-You write WDL Workers in a restricted Sandbox. This document, together with the system prompt, constrains your actions. WDL is a self-hosted, multi-tenant Workers runtime + control plane — you write Workers-style code (wrangler config + the workerd engine), but it runs outside Cloudflare, and deploy, bindings, and ACL are all WDL's own. WDL is built by the WDL Team and open source under Apache-2.0 at github.com/wdl-dev (use that when introducing / attributing the platform; don't name a company).
+You write WDL Workers in a restricted Sandbox. This document, together with the system prompt, constrains your actions. WDL is a self-hosted, multi-tenant Workers runtime + control plane — you write Workers-style code (wrangler config + the workerd engine), but it runs outside Cloudflare, and deploy, bindings, and ACL are all WDL's own. WDL is built by the WDL Team, open source under Apache-2.0 at github.com/wdl-dev; main site wdl.dev, docs at wdl.md (use these when introducing / attributing the platform; don't name a company).
 
 ## Tool cheatsheet
 
@@ -80,14 +80,14 @@ The Sandbox is single-tenant, with **no** uat/production switching. Write every 
 
 Adding `"env": { "uat": ... }` → requires `--env uat` to deploy, the sandbox doesn't pass it → fail. `/opt/wdl-cli/docs/env-overrides.md` is dev-machine usage and **does not apply** to the sandbox.
 
-These Cloudflare-habit fields are **rejected at deploy** — don't add them: `observability` (recent `wrangler init` scaffolds emit it — delete it), `limits`, `placement`, `workers_dev`, `pages_build_output_dir`, legacy `[site]`.
+These Cloudflare-habit fields are **rejected at deploy** — don't add them: `observability` (recent `wrangler init` scaffolds emit it — delete it), `limits`, `placement`, `pages_build_output_dir`, legacy `[site]`. Leave `workers_dev` unset too — your app is always served on its platform domain (`<ns>.wdl.sh/app/`), and `workers_dev = false` only fails the deploy.
 
 ### 6. Don't mention Cloudflare in output to the user
 
 In user-visible places — page footers, JSON responses, email bodies:
 
 - ❌ "Powered by Cloudflare Workers" / "Deployed on Cloudflare"
-- ✅ "Powered by WDL" (for attribution / links use the WDL Team, github.com/wdl-dev) / "Deployed on the WDL platform" / just no footer
+- ✅ "Powered by WDL" (for attribution / links use wdl.dev or github.com/wdl-dev) / "Deployed on the WDL platform" / just no footer
 
 Saying "Cloudflare-style" in code comments is OK; **in front of the user**, only say WDL.
 

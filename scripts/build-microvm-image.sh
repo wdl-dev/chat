@@ -38,7 +38,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
-CLI_TAG="${CLI_TAG:-1.5.0}"   # description only — keep in sync with the pin in docker/Dockerfile.microvm
+CLI_TAG="${CLI_TAG:-1.6.1}"   # description only — keep in sync with the pin in docker/Dockerfile.microvm
 MIN_MEM_MIB="${MIN_MEM_MIB:-512}"
 export AWS_REGION="${AWS_REGION:-ap-northeast-1}"
 # AWS_PROFILE / credentials come from your environment — not defaulted here.

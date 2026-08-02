@@ -1,4 +1,8 @@
+import { consumeOpenAiStream, fromOpenAiResponse, toOpenAiBody } from "./llm-openai.js";
+import { finalizeResponse, parseToolInput, safeEmit, salvageContent, sseFrames } from "./llm-sse.js";
+
 const DEFAULT_BASE_URL = "https://api.deepseek.com/anthropic";
+const DEFAULT_BASE_URL_OPENAI = "https://api.deepseek.com";
 const DEFAULT_MODEL = "deepseek-v4-pro";
 const DEFAULT_MODEL_LITE = "deepseek-v4-flash";
 const DEFAULT_MAX_TOKENS = 16_384;
@@ -13,13 +17,31 @@ function defaultSleep(ms, signal) {
   });
 }
 
+// The raw value is never echoed — the message reaches runs.error and the UI, and a secret pasted
+// into the wrong variable would be published with it.
+function pickEnum(raw, name, def, alt) {
+  if (raw != null && raw !== "" && raw !== def && raw !== alt) {
+    throw new Error(`invalid ${name} (expected "${def}" or "${alt}")`);
+  }
+  return raw === alt ? alt : def;
+}
+
 export function resolveLlmConfig(env) {
+  // A typo must not fall back to Anthropic — that would send the key to the wrong provider
+  // (an OpenAI key as x-api-key to the DeepSeek default URL).
+  const apiShape = pickEnum(env?.LLM_API_SHAPE, "LLM_API_SHAPE", "anthropic", "openai");
   return {
+    apiShape,
     model:      pickString(env?.LLM_MODEL,      DEFAULT_MODEL),
     modelLite:  pickString(env?.LLM_MODEL_LITE, DEFAULT_MODEL_LITE),
-    baseUrl:    pickString(env?.LLM_BASE_URL,   DEFAULT_BASE_URL),
+    baseUrl:    pickString(env?.LLM_BASE_URL, apiShape === "openai" ? DEFAULT_BASE_URL_OPENAI : DEFAULT_BASE_URL).replace(/\/+$/, ""),
     maxTokens:  pickPositiveInt(env?.LLM_MAX_TOKENS, DEFAULT_MAX_TOKENS),
     budgetMs:   pickPositiveInt(env?.LLM_BUDGET_MS,  DEFAULT_BUDGET_MS),
+    reasoningEffort: pickString(env?.LLM_REASONING_EFFORT, null),
+    // OpenAI shape only; the default is the field DeepSeek honors, OpenAI reasoning models need the
+    // override. Strict because Chat Completions silently accepts unknown cap fields (measured with
+    // `max_output_tokens`) — the provider would never surface the typo and the cap would go unenforced.
+    maxTokensParam: pickEnum(env?.LLM_MAX_TOKENS_PARAM, "LLM_MAX_TOKENS_PARAM", "max_tokens", "max_completion_tokens"),
   };
 }
 
@@ -41,7 +63,7 @@ function pickPositiveInt(v, fallback) {
   return (Number.isInteger(n) && n > 0) ? n : fallback;
 }
 
-export function buildRequestBody({ system, messages, tools, maxTokens, model }) {
+export function buildRequestBody({ system, messages, tools, maxTokens, model, reasoningEffort }) {
   const body = {
     model: model || DEFAULT_MODEL,
     max_tokens: maxTokens ?? DEFAULT_MAX_TOKENS,
@@ -49,6 +71,8 @@ export function buildRequestBody({ system, messages, tools, maxTokens, model }) 
   };
   if (system) body.system = system;
   if (Array.isArray(tools) && tools.length > 0) body.tools = tools;
+  // Anthropic-shape effort is nested output_config.effort (top-level reasoning_effort is OpenAI's).
+  if (reasoningEffort) body.output_config = { effort: reasoningEffort };
   return body;
 }
 
@@ -64,27 +88,42 @@ export async function callLlmMessages({
   onDelta,
   maxAttempts = RETRY_DELAYS_MS.length + 1,
   sleep = defaultSleep,
+  // (abortReason) => boolean. True means "this abort was our own deadline, not a provider failure",
+  // so a partially streamed turn is worth keeping rather than discarding.
+  salvageOnAbort,
 }) {
   const apiKey = env.LLM_API_KEY;
   if (!apiKey) throw new Error("LLM_API_KEY not configured");
 
   const cfg = resolveLlmConfig(env);
   const baseUrl = cfg.baseUrl;
+  const openai = cfg.apiShape === "openai";
   const chosenModel = forcedModel ?? pickModel(messages, cfg);
   const wantStream = typeof onDelta === "function";
-  const body = buildRequestBody({
+  const body = (openai ? toOpenAiBody : buildRequestBody)({
     system, messages, tools, model: chosenModel,
     maxTokens: maxTokens ?? cfg.maxTokens,
+    maxTokensParam: cfg.maxTokensParam,
+    reasoningEffort: cfg.reasoningEffort,
   });
-  if (wantStream) body.stream = true;
+  if (wantStream) {
+    body.stream = true;
+    // Standard OpenAI streams only emit the usage frame when it is asked for; Kimi/DeepSeek volunteer it.
+    if (openai) body.stream_options = { include_usage: true };
+  }
 
+  const headers = { "content-type": "application/json" };
+  if (openai) {
+    headers["authorization"] = `Bearer ${apiKey}`;
+  } else {
+    // x-api-key only: some Anthropic-shape endpoints reject an unexpected Authorization header.
+    headers["x-api-key"] = apiKey;
+    headers["anthropic-version"] = ANTHROPIC_VERSION;
+  }
+  const url = openai ? `${baseUrl}/chat/completions` : `${baseUrl}/v1/messages`;
   const init = {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": ANTHROPIC_VERSION,
-    },
+    headers,
     body: JSON.stringify(body),
     signal,
   };
@@ -96,17 +135,17 @@ export async function callLlmMessages({
   for (;;) {
     attempt++;
     try {
-      res = await fetcher(`${baseUrl}/v1/messages`, init);
+      res = await fetcher(url, init);
     } catch (err) {
       if (signal?.aborted || attempt >= maxAttempts) throw err;
       console.warn(`LLM attempt ${attempt}/${maxAttempts} failed model=${chosenModel} cause=network`);
-      await sleep(RETRY_DELAYS_MS[attempt - 1], signal);
+      await sleep(RETRY_DELAYS_MS[attempt - 1] ?? RETRY_DELAYS_MS.at(-1), signal);
       continue;
     }
     if ((res.status === 429 || res.status >= 500) && attempt < maxAttempts && !signal?.aborted) {
       try { await res.body?.cancel?.(); } catch { /* free the connection */ }
       console.warn(`LLM attempt ${attempt}/${maxAttempts} failed model=${chosenModel} cause=${res.status}`);
-      await sleep(RETRY_DELAYS_MS[attempt - 1], signal);
+      await sleep(RETRY_DELAYS_MS[attempt - 1] ?? RETRY_DELAYS_MS.at(-1), signal);
       continue;
     }
     break;
@@ -119,28 +158,52 @@ export async function callLlmMessages({
     throw err;
   }
   // Log only once the body is fully parsed: 2xx headers can still be followed by a JSON/SSE read failure.
-  const parsed = wantStream ? await consumeAnthropicStream(res, onDelta) : await res.json();
+  let parsed;
+  if (wantStream) {
+    try {
+      parsed = await (openai ? consumeOpenAiStream(res, onDelta) : consumeAnthropicStream(res, onDelta));
+    } catch (err) {
+      if (!err?.partial || !salvageOnAbort?.(signal?.reason)) throw err;
+      parsed = err.partial;
+      parsed.salvaged = true;
+      console.warn(`LLM salvaged a cut-short turn model=${chosenModel} reason=${String(signal?.reason)} ${Date.now() - startedAt}ms`);
+    }
+  } else {
+    // A JSON.parse error's message carries the raw body — throw a fixed one so it can't leak into runs.error.
+    let json;
+    try { json = await res.json(); } catch { throw new Error("LLM response: malformed JSON body"); }
+    // Some gateways answer HTTP 200 with an error body; both stream consumers already detect this.
+    if (json?.error) throw new Error("LLM provider returned an error");
+    parsed = openai ? fromOpenAiResponse(json) : json;
+  }
+  parsed = finalizeResponse(parsed, wantStream ? onDelta : undefined);
   if (attempt > 1) {
     console.log(`LLM ok after ${attempt} attempts model=${chosenModel} ${Date.now() - startedAt}ms`);
   }
   return parsed;
 }
 
+const HANDLED_EVENTS = new Set([
+  "error", "message_start", "content_block_start", "content_block_delta", "content_block_stop",
+  "message_delta", "message_stop",
+]);
+
 // Returns the same shape as the non-streaming /v1/messages response.
 async function consumeAnthropicStream(res, onDelta) {
-  if (!res.body) throw new Error("LLM streaming response has no body");
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
   const blocks = [];
   const partialJson = [];
   let stopReason = null;
   let usage = null;
   let messageMeta = null;
+  let sawMessageStop = false;
 
-  const emit = (e) => { try { onDelta?.(e); } catch { /* a consumer error must not break the stream */ } };
+  const emit = safeEmit(onDelta);
 
   const flushBlock = (eventName, data) => {
+    if (eventName === "error") {
+      // Never surface OR log upstream fields — type/message are free-form and can echo prompt/context.
+      throw new Error("LLM stream error");
+    }
     if (eventName === "message_start") {
       messageMeta = data?.message ?? null;
       if (messageMeta?.usage) usage = messageMeta.usage;
@@ -151,6 +214,9 @@ async function consumeAnthropicStream(res, onDelta) {
       const block = { ...(data?.content_block ?? {}) };
       blocks[idx] = block;
       if (block.type === "tool_use") {
+        // The wire's content_block_start carries an `input: {}` placeholder. Drop it so
+        // `input !== undefined` genuinely means "content_block_stop ran" (the salvage predicate).
+        delete block.input;
         partialJson[idx] = "";
         emit({ type: "tool_use_partial", index: idx, id: block.id, name: block.name });
       }
@@ -172,6 +238,7 @@ async function consumeAnthropicStream(res, onDelta) {
         block.signature = (block.signature ?? "") + delta.signature;
       } else if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
         partialJson[idx] = (partialJson[idx] ?? "") + delta.partial_json;
+        emit({ type: "tool_use_progress", index: idx, name: block.name, bytes: partialJson[idx].length, head: partialJson[idx].slice(0, 300) });
       }
       return;
     }
@@ -180,9 +247,7 @@ async function consumeAnthropicStream(res, onDelta) {
       const block = blocks[idx];
       if (!block) return;
       if (block.type === "tool_use") {
-        const raw = partialJson[idx] ?? "";
-        try { block.input = raw.length > 0 ? JSON.parse(raw) : {}; }
-        catch { block.input = {}; }
+        block.input = parseToolInput(partialJson[idx]);
         emit({ type: "tool_use_complete", index: idx, id: block.id, name: block.name, input: block.input });
       }
       return;
@@ -193,50 +258,49 @@ async function consumeAnthropicStream(res, onDelta) {
       return;
     }
     if (eventName === "message_stop") {
-      emit({ type: "message_complete", stop_reason: stopReason });
+      sawMessageStop = true;   // message_complete is emitted by finalizeResponse, once it has passed
       return;
-    }
-    if (eventName === "error") {
-      // Never surface OR log upstream fields — type/message are free-form and can echo prompt/context.
-      throw new Error("LLM stream error");
     }
   };
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    // Normalize CRLF on the whole buffer: a \r\n can straddle a chunk boundary.
-    buf = buf.replace(/\r\n/g, "\n");
-    while (true) {
-      const sep = buf.indexOf("\n\n");
-      if (sep === -1) break;
-      const block = buf.slice(0, sep);
-      buf = buf.slice(sep + 2);
-      let eventName = null;
-      let dataStr = "";
-      for (const line of block.split("\n")) {
-        if (line.startsWith("event:")) eventName = line.slice(6).trim();
-        // SSE: multiple data: lines in one event join with \n.
-        else if (line.startsWith("data:")) dataStr += (dataStr ? "\n" : "") + line.slice(5).replace(/^ /, "");
-      }
-      if (!eventName) continue;
-      let data = null;
-      if (dataStr.length > 0) {
-        try { data = JSON.parse(dataStr); } catch { data = null; }
-      }
-      flushBlock(eventName, data);
-    }
-  }
-
-  return {
+  const build = (content, stop) => ({
     id: messageMeta?.id ?? null,
     type: "message",
     role: messageMeta?.role ?? "assistant",
     model: messageMeta?.model ?? null,
-    content: blocks.filter(b => b !== undefined),
-    stop_reason: stopReason,
+    content,
+    stop_reason: stop,
     stop_sequence: null,
     usage,
-  };
+  });
+  const present = () => blocks.filter(b => b !== undefined);
+
+  try {
+    for await (const { event, dataStr } of sseFrames(res)) {
+      // Anything else (a proxy keepalive, a provider notice) carries nothing we consume, and its
+      // payload is not always JSON.
+      if (!HANDLED_EVENTS.has(event)) continue;
+      let data = null;
+      if (dataStr.length > 0) {
+        // Skip, same as the OpenAI wire: one corrupted frame costs its delta, not the whole turn.
+        // Except the terminator — it needs no payload, and skipping it would fail a delivered turn.
+        try { data = JSON.parse(dataStr); } catch { if (event !== "message_stop") continue; }
+      }
+      flushBlock(event, data);
+      if (sawMessageStop) break;   // final event — stop, don't wait for HTTP EOF
+    }
+  } catch (err) {
+    throw salvaged(err);
+  }
+  // Either missing means the stream was cut short, and recording a partial turn as finished would
+  // hand the model a truncated answer as if it were complete.
+  if (!stopReason || !sawMessageStop) throw salvaged(new Error("LLM stream did not complete"));
+
+  return build(present(), stopReason);
+
+  function salvaged(err) {
+    const part = salvageContent(present());
+    if (part) err.partial = build(part.content, part.stop_reason);
+    return err;
+  }
 }

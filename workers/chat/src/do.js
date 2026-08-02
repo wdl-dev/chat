@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
-import { bytesToBase64, capText, errMessage, extractText, httpError, jsonResponse, newRunId, safeUploadName, sseEvent, toolResultBlock, uniqueUploadName } from "./lib.js";
+import { bytesToBase64, capText, errMessage, extractText, httpError, jsonResponse, newRunId, parseJson, safeUploadName, sseEvent, toolResultBlock, uniqueUploadName } from "./lib.js";
 import { callLlmMessages, resolveLlmConfig } from "./llm.js";
-import { isUserTextTurn, replayLlmTurnOutcome, replayPlanOutcome, toolBatchAlreadyRan, windowLlmMessages } from "./messages.js";
+import { hasAnswerContent, isUserTextTurn, replayLlmTurnOutcome, replayPlanOutcome, toolBatchAlreadyRan, windowLlmMessages } from "./messages.js";
 import { decideStartRun, isTerminalRunStatus } from "./runstate.js";
 import { dispatchTool, uploadAsset } from "./tools.js";
 import { TOOL_DEFINITIONS, promptPack, isInternalMarker } from "./agent-prompt.js";
@@ -72,12 +72,23 @@ function capStepOutput(output) {
   return capped;
 }
 
+// The captured group comes from a JSON string literal that may still be mid-escape.
+function unescapeJsonString(raw) {
+  try { return JSON.parse(`"${raw}"`); } catch { return raw; }
+}
+
 // Cap the tool_use blocks in an assistant turn so a runaway turn can't require an unbounded batch of
 // tool_results anywhere downstream (dispatch, supersede synth, redispatch). Non-tool_use blocks kept.
 function capToolUses(content) {
   if (!Array.isArray(content)) return content;
   let seen = 0;
   return content.filter(b => b?.type !== "tool_use" || ++seen <= MAX_TOOL_USES_PER_TURN);
+}
+
+// Strict equality, so a step journaled before batchSeq existed matches nothing and its tool re-runs —
+// the safe direction, and only reachable for a run in flight when its facet picked up this version.
+function sameBatch(stepInput, batchSeq) {
+  return stepInput?.batchSeq === batchSeq;
 }
 
 function firstRow(cursor) {
@@ -226,8 +237,7 @@ export class ChatSessionDO extends DurableObject {
       "SELECT seq, role, content FROM messages ORDER BY seq DESC LIMIT 1",
     ));
     if (!last || last.role !== "assistant") return;
-    let blocks;
-    try { blocks = JSON.parse(last.content); } catch { return; }
+    const blocks = parseJson(last.content);
     if (!Array.isArray(blocks)) return;
     const toolUses = blocks.filter(b => b?.type === "tool_use");
     if (toolUses.length === 0) return;
@@ -381,9 +391,51 @@ export class ChatSessionDO extends DurableObject {
     return seq;
   }
 
+  // Turns stream deltas into UI broadcasts; the closure's maps carry the per-turn throttle state.
+  _progressBroadcaster(runId) {
+    const toolBytes = new Map();
+    const toolPaths = new Map();
+    const thinkingStartAt = new Map();
+    const thinkingLastAt = new Map();
+    return (event) => {
+      if (event.type === "text_delta") {
+        this._broadcast("message.assistant_streaming", { runId, blockIndex: event.index, delta: event.text });
+      } else if (event.type === "thinking_delta") {
+        // Reasoning can run for most of a turn with nothing else on screen. Announce it and let
+        // the client count the seconds; the text itself still renders collapsed at commit.
+        // Rebroadcast every few seconds rather than once: a reattach replays run.scheduled,
+        // which clears the client's row, and an interleaved thinking block after text must
+        // re-arm it — the client ignores repeats while its indicator is live.
+        const last = thinkingLastAt.get(event.index);
+        if (last !== undefined && Date.now() - last < 5000) return;
+        thinkingLastAt.set(event.index, Date.now());
+        // startedAt rides along so a reattached client shows the true elapsed, not a reset counter.
+        const startedAt = thinkingStartAt.get(event.index) ?? Date.now();
+        thinkingStartAt.set(event.index, startedAt);
+        this._broadcast("message.thinking", { runId, blockIndex: event.index, startedAt });
+      } else if (event.type === "tool_use_partial") {
+        toolBytes.set(event.index, 0);
+        this._broadcast("message.tool_pending", { runId, blockIndex: event.index, name: event.name, bytes: 0 });
+      } else if (event.type === "tool_use_progress") {
+        // `path` is the first property the file tools declare, so it lands in the opening bytes —
+        // surface it while the content is still streaming rather than only at commit.
+        let foundPath = false;
+        if (!toolPaths.has(event.index)) {
+          const m = /"path"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(event.head ?? "");
+          if (m) { toolPaths.set(event.index, unescapeJsonString(m[1])); foundPath = true; }
+        }
+        // Otherwise one broadcast per 2 KB — the point is visible movement, not byte accuracy.
+        if (!foundPath && event.bytes - (toolBytes.get(event.index) ?? 0) < 2048) return;
+        toolBytes.set(event.index, event.bytes);
+        this._broadcast("message.tool_pending", {
+          runId, blockIndex: event.index, name: event.name, path: toolPaths.get(event.index), bytes: event.bytes,
+        });
+      }
+    };
+  }
+
   // Budget the LLM await (cfg.budgetMs) so the step can't outlive the dispatch; returns the response or an {outcome}.
-  async _runLlmStep({ runId, stepNo, system, messages, tools, maxTokens, silent = false, reasoning = false }) {
-    const cfg = resolveLlmConfig(this.env);
+  async _runLlmStep({ runId, stepNo, cfg, system, messages, tools, maxTokens, silent = false, reasoning = false }) {
     const ac = new AbortController();
     const timer = setTimeout(() => {
       this.sql.exec(
@@ -405,11 +457,11 @@ export class ChatSessionDO extends DurableObject {
         // reasoning: force the full model (don't let pickModel silently downgrade the plan).
         model: reasoning ? cfg.model : undefined,
         signal: ac.signal,
-        onDelta: silent ? undefined : (event) => {
-          if (event.type === "text_delta") {
-            this._broadcast("message.assistant_streaming", { runId, blockIndex: event.index, delta: event.text });
-          }
-        },
+        // The budget is our own deadline: keep whatever the turn already produced instead of
+        // throwing away work the user watched stream in. A user Stop/Close carries a different
+        // reason and still discards, which is what they asked for.
+        salvageOnAbort: (reason) => reason === "llm_timeout",
+        onDelta: silent ? undefined : this._progressBroadcaster(runId),
       });
     } catch (err) {
       this._releaseAbort(runId, ac);
@@ -423,9 +475,19 @@ export class ChatSessionDO extends DurableObject {
     }
     this._releaseAbort(runId, ac);
     clearTimeout(timer);
+    if (resp?.salvaged) {
+      // Undo the deadline's own cancel so the loop continues with the partial turn. Scoped to
+      // 'llm_timeout': a user Stop writes its own reason (_cancelRun overwrites, only the timer
+      // COALESCEs), so whichever side of the deadline it lands on it doesn't match here, the cancel
+      // survives, and the check below discards the salvage — Stop always wins.
+      this.sql.exec(
+        "UPDATE runs SET cancel_requested = 0, cancel_reason = NULL WHERE run_id = ? AND cancel_reason = 'llm_timeout'",
+        runId,
+      );
+    }
     // Landing race: a supersede/cancel can arrive while the LLM await is in flight (or as it resolves).
     // Don't record a stale reply — it could sort after the new user turn and poison the next context.
-    if (ac.signal.aborted || this._isCancelled(runId)) {
+    if ((ac.signal.aborted && !resp?.salvaged) || this._isCancelled(runId)) {
       const reason = this._abortReason(ac.signal, runId) ?? this._readCancelReason(runId);
       this._completeStep(runId, stepNo, { aborted: true, reason }, "aborted");
       return { outcome: "aborted", reason };
@@ -445,9 +507,10 @@ export class ChatSessionDO extends DurableObject {
 
   async _executeLlmTurn(runId, planContext) {
     const messages = this._buildLlmMessages({ maxMessages: 60 });
+    // Before journaling the step, so a bad LLM_* value fails the run without leaving one behind.
+    const cfg = resolveLlmConfig(this.env);
     const stepNo = this._startLlmStep(runId, "llm_call", messages.length);
 
-    const cfg = resolveLlmConfig(this.env);
     const P = promptPack(this._lang());
     const planSuffix = (typeof planContext === "string" && planContext.length > 0)
       ? P.planSuffix(planContext)
@@ -459,17 +522,23 @@ export class ChatSessionDO extends DurableObject {
     const system = P.system + planSuffix + anchorSuffix + assetsSuffix;
 
     const result = await this._runLlmStep({
-      runId, stepNo, system, messages,
+      runId, stepNo, cfg, system, messages,
       tools: TOOL_DEFINITIONS, maxTokens: cfg.maxTokens,
     });
     if (result?.outcome) return result;
     const resp = result;
 
     if (this._isCancelled(runId)) return { outcome: "aborted" };
+    const content = resp?.content ?? [];
+    if (!hasAnswerContent(content)) {
+      // Not recorded: replayed forever, a text-less tool-less assistant turn can 400 strict
+      // providers for the rest of the session, and the retry is cleaner without it.
+      return { outcome: "done", stopReason: resp?.stop_reason ?? null, hasToolUses: false, hasOutput: false };
+    }
     this._recordAssistant(resp);
 
-    const hasToolUses = (resp?.content ?? []).some(b => b?.type === "tool_use");
-    return { outcome: "done", stopReason: resp?.stop_reason ?? null, hasToolUses };
+    const hasToolUses = content.some(b => b?.type === "tool_use");
+    return { outcome: "done", stopReason: resp?.stop_reason ?? null, hasToolUses, hasOutput: true };
   }
 
   async workflowRunToolBatch({ runId }) {
@@ -482,8 +551,11 @@ export class ChatSessionDO extends DurableObject {
 
   async _runToolBatch(runId) {
     const lastAsst = firstRow(this.sql.exec(
-      "SELECT content FROM messages WHERE role = 'assistant' ORDER BY seq DESC LIMIT 1",
+      "SELECT seq, content FROM messages WHERE role = 'assistant' ORDER BY seq DESC LIMIT 1",
     ));
+    // The assistant turn's seq scopes replay: providers reuse ids like `call_0` across turns, so a
+    // later batch must not inherit an earlier batch's result for the same id.
+    const batchSeq = lastAsst?.seq ?? null;
     let toolUses = [];
     try {
       const blocks = JSON.parse(lastAsst?.content ?? "[]");
@@ -506,8 +578,8 @@ export class ChatSessionDO extends DurableObject {
     const ctx = this._buildToolCtx();
     const toolResults = [];
     let abortedMidway = false;
-    const completedTools = this._completedToolResults(runId);
-    const priorRunning = this._priorRunningTools(runId);
+    const completedTools = this._completedToolResults(runId, batchSeq);
+    const priorRunning = this._priorRunningTools(runId, batchSeq);
     let i = 0;
     while (i < toolUses.length) {
       if (this._isCancelled(runId)) { abortedMidway = true; break; }
@@ -521,7 +593,7 @@ export class ChatSessionDO extends DurableObject {
 
       if (j > i + 1) {
         const batch = toolUses.slice(i, j);
-        const result = await this._dispatchToolBatchParallel(runId, ctx, batch);
+        const result = await this._dispatchToolBatchParallel(runId, ctx, batch, batchSeq);
         toolResults.push(...result.toolResults);
         if (result.abortedMidway) { abortedMidway = true; break; }
         i = j;
@@ -540,7 +612,7 @@ export class ChatSessionDO extends DurableObject {
         i++;
         continue;
       }
-      const result = await this._dispatchOneTool(runId, ctx, tu);
+      const result = await this._dispatchOneTool(runId, ctx, tu, batchSeq);
       toolResults.push(result.toolResult);
       if (result.status === "done" && tu.name === "deploy_test" && result.output?.versionId && result.output.previewUrl) {
         this._broadcast("preview.ready", {
@@ -622,13 +694,15 @@ export class ChatSessionDO extends DurableObject {
 
   async _runPlanLlm(runId, kind, attempt = 0) {
     const messages = this._buildLlmMessages({ stripTools: true, maxMessages: 20 });
+    // Before journaling the step, so a bad LLM_* value fails the run without leaving one behind.
+    const cfg = resolveLlmConfig(this.env);
     const stepNo = this._startLlmStep(runId, kind, messages.length);
 
     const P = promptPack(this._lang());
     const assets = this._readAssets();
     const planSystem = P.planSystem + (assets.length ? P.assetsSuffix(assets) : "");
     const result = await this._runLlmStep({
-      runId, stepNo, system: planSystem, messages,
+      runId, stepNo, cfg, system: planSystem, messages,
       // Reasoning model, silent: room for chain-of-thought; plan renders as a card, not a bubble.
       tools: [], maxTokens: 8192, silent: true, reasoning: true,
     });
@@ -653,19 +727,18 @@ export class ChatSessionDO extends DurableObject {
     return (typeof signal.reason === "string" ? signal.reason : null) ?? this._readCancelReason(runId);
   }
 
-  // A tool_use with a terminal result on a prior dispatch — lets a re-dispatched batch reuse it.
-  _completedToolResults(runId) {
+  // A tool_use with a terminal result on a prior dispatch of THIS batch — lets a re-dispatch reuse it.
+  _completedToolResults(runId, batchSeq) {
     const out = new Map();
     for (const row of this.sql.exec(
       "SELECT input, output, status FROM steps WHERE run_id = ? AND kind = 'tool_call' AND status IN ('done', 'failed')",
       runId,
     )) {
-      let input;
-      try { input = JSON.parse(row.input); } catch { continue; }
+      const input = parseJson(row.input);
+      if (!input || !sameBatch(input, batchSeq)) continue;
       const id = input?.toolUseId;
       if (!id || out.has(id)) continue;
-      let output;
-      try { output = JSON.parse(row.output); } catch { output = null; }
+      const output = parseJson(row.output);
       out.set(id, toolResultBlock(id, output, row.status !== "done"));
     }
     return out;
@@ -673,13 +746,14 @@ export class ChatSessionDO extends DurableObject {
 
   // Non-terminal ('running') tool_call steps left by a prior dispatch — keyed by toolUseId so a
   // redispatch can fail closed on a side-effecting tool whose completion was never recorded.
-  _priorRunningTools(runId) {
+  _priorRunningTools(runId, batchSeq) {
     const out = new Map();
     for (const row of this.sql.exec(
       "SELECT step_no, input FROM steps WHERE run_id = ? AND kind = 'tool_call' AND status = 'running'",
       runId,
     )) {
-      let input; try { input = JSON.parse(row.input); } catch { continue; }
+      const input = parseJson(row.input);
+      if (!input || !sameBatch(input, batchSeq)) continue;
       const id = input?.toolUseId;
       if (!id || out.has(id)) continue;
       out.set(id, { name: input?.name, stepNo: row.step_no });
@@ -687,9 +761,9 @@ export class ChatSessionDO extends DurableObject {
     return out;
   }
 
-  _startToolStep(runId, tu) {
+  _startToolStep(runId, tu, batchSeq) {
     const stepNo = this._nextStepNo(runId);
-    this._insertStep(runId, stepNo, "tool_call", { name: tu.name, input: tu.input, toolUseId: tu.id });
+    this._insertStep(runId, stepNo, "tool_call", { name: tu.name, input: tu.input, toolUseId: tu.id, batchSeq });
     return stepNo;
   }
 
@@ -710,15 +784,13 @@ export class ChatSessionDO extends DurableObject {
 
   // Plan-draft messages render as a card, not a bubble; track their seqs to skip on replay.
   _addPlanDraftSeq(seq) {
-    let arr;
-    try { arr = JSON.parse(this._readMeta("planDraftSeqs")); } catch { arr = []; }
+    let arr = parseJson(this._readMeta("planDraftSeqs"));
     if (!Array.isArray(arr)) arr = [];
     arr.push(seq);
     this._writeMeta("planDraftSeqs", JSON.stringify(arr));
   }
   _isPlanDraftSeq(seq) {
-    let arr;
-    try { arr = JSON.parse(this._readMeta("planDraftSeqs")); } catch { return false; }
+    const arr = parseJson(this._readMeta("planDraftSeqs"));
     return Array.isArray(arr) && arr.includes(seq);
   }
 
@@ -741,8 +813,8 @@ export class ChatSessionDO extends DurableObject {
     return { status, output, toolResult: toolResultBlock(tu.id, output, status !== "done") };
   }
 
-  async _dispatchOneTool(runId, ctx, tu) {
-    const stepNo = this._startToolStep(runId, tu);
+  async _dispatchOneTool(runId, ctx, tu, batchSeq) {
+    const stepNo = this._startToolStep(runId, tu, batchSeq);
     const tac = new AbortController();
     this._registerAbort(runId, tac);
     let settled;
@@ -756,8 +828,8 @@ export class ChatSessionDO extends DurableObject {
   }
 
   // Shared AbortController so a cancel cascades to every child fetch.
-  async _dispatchToolBatchParallel(runId, ctx, batch) {
-    const stepNos = batch.map(tu => this._startToolStep(runId, tu));
+  async _dispatchToolBatchParallel(runId, ctx, batch, batchSeq) {
+    const stepNos = batch.map(tu => this._startToolStep(runId, tu, batchSeq));
     const tac = new AbortController();
     this._registerAbort(runId, tac);
     let abortedMidway = false;
@@ -779,8 +851,8 @@ export class ChatSessionDO extends DurableObject {
     for (const row of this.sql.exec(
       "SELECT content FROM messages WHERE role = 'user' ORDER BY seq DESC",
     )) {
-      let blocks;
-      try { blocks = JSON.parse(row.content); } catch { continue; }
+      const blocks = parseJson(row.content);
+      if (!blocks) continue;
       if (!Array.isArray(blocks)) continue;
       const text = extractText(blocks);
       if (!text) continue;
@@ -1006,8 +1078,8 @@ export class ChatSessionDO extends DurableObject {
   _readAssets() {
     const raw = this._readMeta("assets");
     if (!raw) return [];
-    try { const a = JSON.parse(raw); return Array.isArray(a) ? a.filter(x => typeof x === "string") : []; }
-    catch { return []; }
+    const a = parseJson(raw);
+    return Array.isArray(a) ? a.filter(x => typeof x === "string") : [];
   }
 
   _recordAssets(names) {

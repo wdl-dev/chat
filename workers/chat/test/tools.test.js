@@ -864,3 +864,13 @@ test("call_preview surfaces log truncation as logs_truncated", async () => {
   assert.equal(r.logs.length, 50, "capped at CALL_PREVIEW_TAIL_MAX_EVENTS");
   assert.equal(r.logs_truncated, "maxEvents");
 });
+
+test("drainTailSse frames a CRLF-terminated tail stream", async () => {
+  const enc = new TextEncoder();
+  const chunks = [enc.encode('event: worker_console\r\ndata: {"m":1}\r\n\r\nevent: worker_console\r\ndata: {"m":2}\r\n\r\n')];
+  let i = 0;
+  const reader = { read: async () => i < chunks.length ? { value: chunks[i++], done: false } : { done: true } };
+  const { events, truncated } = await __test__.drainTailSse(reader, { maxEvents: 10, maxBytes: 10000 });
+  assert.equal(truncated, null);
+  assert.deepEqual(events.map(e => e.data.m), [1, 2]);
+});
