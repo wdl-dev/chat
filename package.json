@@ -24,7 +24,7 @@
     "bootstrap": "node scripts/bootstrap.js"
   },
   "devDependencies": {
-    "@wdl-dev/cli": "1.6.1"
+    "@wdl-dev/cli": "1.7.1"
   },
   "engines": {
     "node": ">=24"

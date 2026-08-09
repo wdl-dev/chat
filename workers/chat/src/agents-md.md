@@ -175,12 +175,14 @@ sandbox 约束：
 - `[[migrations]]` 用 `new_sqlite_classes`（也接受 `new_classes`，两者在 WDL 都映射到 SQLite-backed storage）
 - class 要 `export`，worker 名固定 `app`，配置仍**扁平无 env**
 - 部署 / 调试照常 `deploy_test` / `call_preview`
+- **写 DO 或 WebSocket worker 时就在配置里加 `"wdl": { "session_policy": "restart" }`**：默认 `preserve` 把已构造的 facet 留在建它的那个版本上，于是改完代码 `deploy_test` 再 `call_preview`，打到的仍是**旧代码**——看起来像"改了没生效"。`restart` 让每次 promote 在下次 dispatch 退掉旧 facet（SQLite 数据保留），并在 promote 当场以 `1012` 关掉旧版本的 WebSocket。
 
 ```jsonc
 {
   "name": "app",
   "main": "src/index.js",
   "compatibility_date": "2026-06-17",
+  "wdl": { "session_policy": "restart" },
   "durable_objects": { "bindings": [{ "name": "ROOMS", "class_name": "Room" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }]
 }

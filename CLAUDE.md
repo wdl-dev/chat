@@ -373,7 +373,13 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   pack the bundle, then calls control `/ns/<ns>/worker/app/deploy` + `/promote` directly
   with `x-admin-token: ctx.nsToken`. The MicroVM only packs; chat-worker owns the control
   calls. previewUrl = `https://<ns>.wdl.sh/app/`. The packaged stderr surfaces in the
-  tool's `upstream` field so the AI sees the real wrangler error.
+  tool's `upstream` field so the AI sees the real wrangler error. A generated project's
+  `[wdl] session_policy` rides through as `manifest.sessionPolicy` (pack → `/package` stdout →
+  the deploy body), so `restart` works on this path even though it never runs `wdl deploy`;
+  an unconfirmed restart on the promote response is a **warning**, not an error — the version
+  is live either way and the real consequence is that old facets survived. Only the promote
+  response is checked: the CLI also checks the deploy response, but that exists to fail
+  *before* promoting, which is not a choice this path has.
 - **sandbox-agent runs as root, AI subprocesses run as `sandbox` uid (2000).** The
   supervisor is root (so `gosu` needs no setuid); AI subprocesses spawn via `gosu sandbox`
   and Linux `/proc/<pid>/environ` 0400 owner-only is the env-isolation boundary — the
@@ -392,7 +398,12 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
 - **DO facets are pinned to the worker version they were constructed with.** Redeploying
   chat-worker does not patch in-flight sessions — they run the old code until the host actor
   restarts or the session closes. Mid-session fixes need operator force-close
-  (`/admin/sessions/<id>/force-close`) or user Close.
+  (`/admin/sessions/<id>/force-close`) or user Close. The opt-out
+  (`"wdl": { "session_policy": "restart" }`, which retires old facets on their next dispatch and
+  closes old-version WebSockets with 1012) is deliberately **not** set here: every deploy would
+  abort live users' in-flight runs, while the pinning only inconveniences development. The sandbox
+  AGENTS.md does teach it — an AI iterating on a generated DO worker otherwise `call_preview`s its
+  own stale facet and reads the result as "my fix did nothing".
 - **Stream replay.** `GET /stream` (WebSocket or SSE) re-emits, on every (re)attach, the
   message history (frontend de-dups by `seq`), the current run's state (`run.scheduled`, mode
   derived from whether it's parked at plan), and the plan card if parked. It picks the

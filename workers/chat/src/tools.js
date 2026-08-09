@@ -488,6 +488,10 @@ async function deployTest(ctx, _input, signal, fetcher) {
 
   const prom = await controlPost(`worker/${nameEnc}/promote`, { version });
   if (!prom.ok) return { error: `control promote failed (${prom.status})`, upstream: prom.text.slice(0, 4000) };
+  if (artifact?.sessionPolicy === "restart"
+    && !(prom.json.sessionPolicy === "restart" && Number.isSafeInteger(prom.json.restartSequence) && prom.json.restartSequence > 0)) {
+    warnings.push("session_policy: restart was not confirmed on promote — old Durable Object facets and WebSockets may still be running the previous version.");
+  }
 
   const previewUrl = buildPreviewUrl(ctx.ns, prom.json.platformDomain ?? ctx.env.PLATFORM_DOMAIN);
   if (previewUrl) ctx.setPreviewUrl(previewUrl);

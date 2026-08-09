@@ -699,6 +699,36 @@ test("deploy_test packs on the MicroVM then deploys + promotes via control", asy
   assert.match(calls[2].url, /\/ns\/tmp-1234\/worker\/app\/promote$/);
 });
 
+test("deploy_test warns when a requested restart policy is not confirmed on promote", async () => {
+  const cases = [
+    { name: "confirmed", promote: { sessionPolicy: "restart", restartSequence: 4 }, warns: false },
+    { name: "silent", promote: { ok: true }, warns: true },
+    { name: "zero sequence", promote: { sessionPolicy: "restart", restartSequence: 0 }, warns: true },
+  ];
+  for (const { name, promote, warns } of cases) {
+    const { fetcher } = makeFetcher((url) => {
+      if (url.endsWith("/package")) return { body: { mainModule: "index.js", modules: {}, assets: {}, sessionPolicy: "restart" } };
+      if (url.endsWith("/deploy")) return { body: { version: "v3" } };
+      if (url.endsWith("/promote")) return { body: promote };
+      return null;
+    });
+    const out = await dispatchTool({ name: "deploy_test", input: {}, ctx: makeCtx(), signal: undefined, fetcher });
+    assert.equal(out.versionId, "v3", name);
+    assert.equal(out.warnings.some(w => /restart was not confirmed/.test(w)), warns, name);
+  }
+});
+
+test("deploy_test does not warn about restart when the project never asked for it", async () => {
+  const { fetcher } = makeFetcher((url) => {
+    if (url.endsWith("/package")) return { body: { mainModule: "index.js", modules: {}, assets: {} } };
+    if (url.endsWith("/deploy")) return { body: { version: "v3" } };
+    if (url.endsWith("/promote")) return { body: { ok: true } };
+    return null;
+  });
+  const out = await dispatchTool({ name: "deploy_test", input: {}, ctx: makeCtx(), signal: undefined, fetcher });
+  assert.deepEqual(out.warnings, []);
+});
+
 test("call_preview rejects when no previewUrl yet", async () => {
   const ctx = makeCtx();
   const r = await dispatchTool({ name: "call_preview", input: { path: "/" }, ctx, signal: undefined, fetcher: () => null });

@@ -175,12 +175,14 @@ Sandbox constraints:
 - `[[migrations]]` use `new_sqlite_classes` (also accepts `new_classes`; both map to SQLite-backed storage in WDL)
 - the class must be `export`ed, the worker name is fixed to `app`, and the config is still **flat with no env**
 - deploy / debug as usual with `deploy_test` / `call_preview`
+- **Put `"wdl": { "session_policy": "restart" }` in the config when you write a DO or WebSocket worker**: the default `preserve` leaves already-constructed facets on the version that built them, so after a code change `deploy_test` + `call_preview` still hits the **old code** — it looks like "my fix did nothing". `restart` retires old facets on their next dispatch (SQLite state is kept) and closes old-version WebSockets with `1012` at promotion time.
 
 ```jsonc
 {
   "name": "app",
   "main": "src/index.js",
   "compatibility_date": "2026-06-17",
+  "wdl": { "session_policy": "restart" },
   "durable_objects": { "bindings": [{ "name": "ROOMS", "class_name": "Room" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }]
 }
