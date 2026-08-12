@@ -86,6 +86,92 @@ test("read_file routes to GET /read-file?sessionId&path on the MicroVM with the 
   assert.equal(calls[0].init.headers["X-aws-proxy-auth"], "jwe-tok");
 });
 
+test("read_file returns a line window with offset/limit and leaves the whole-file path unchanged", async () => {
+  const content = Array.from({ length: 10 }, (_, i) => `line${i + 1}`).join("\n");
+  const fetcherFor = () => makeFetcher(() => ({ body: { path: "/workspace/x", content } })).fetcher;
+
+  const whole = await dispatchTool({ name: "read_file", input: { path: "/workspace/x" }, ctx: makeCtx(), signal: undefined, fetcher: fetcherFor() });
+  assert.equal(whole.content, content);
+  assert.equal(whole.lines, undefined);
+
+  const win = await dispatchTool({ name: "read_file", input: { path: "/workspace/x", offset: 3, limit: 2 }, ctx: makeCtx(), signal: undefined, fetcher: fetcherFor() });
+  assert.equal(win.content, "line3\nline4");
+  assert.deepEqual(win.lines, { from: 3, to: 4, total: 10 });
+
+  // A window RUNNING past EOF clamps to the last line; a window STARTING past EOF must error —
+  // clamping the start would hand a paginator the last line again on every further step.
+  const tail = await dispatchTool({ name: "read_file", input: { path: "/workspace/x", offset: 9, limit: 500 }, ctx: makeCtx(), signal: undefined, fetcher: fetcherFor() });
+  assert.deepEqual(tail.lines, { from: 9, to: 10, total: 10 });
+  const past = await dispatchTool({ name: "read_file", input: { path: "/workspace/x", offset: 99 }, ctx: makeCtx(), signal: undefined, fetcher: fetcherFor() });
+  assert.match(past.error, /past the end .*10 lines/);
+});
+
+test("read_file counts newline-terminated files like wc -l", async () => {
+  const fetcherFor = (content) => makeFetcher(() => ({ body: { path: "x", content } })).fetcher;
+
+  // Trailing newline: no phantom empty line, no blank success page before the EOF error.
+  const t = await dispatchTool({ name: "read_file", input: { path: "x", offset: 2 }, ctx: makeCtx(), signal: undefined, fetcher: fetcherFor("line1\nline2\n") });
+  assert.deepEqual(t, { path: "x", content: "line2", lines: { from: 2, to: 2, total: 2 } });
+  const past = await dispatchTool({ name: "read_file", input: { path: "x", offset: 3 }, ctx: makeCtx(), signal: undefined, fetcher: fetcherFor("line1\nline2\n") });
+  assert.match(past.error, /past the end .*2 lines/);
+
+  // "a\n\n" is two lines (second empty); an empty file is zero lines, so windowing it is past-the-end.
+  const blank = await dispatchTool({ name: "read_file", input: { path: "x", offset: 2 }, ctx: makeCtx(), signal: undefined, fetcher: fetcherFor("a\n\n") });
+  assert.deepEqual(blank.lines, { from: 2, to: 2, total: 2 });
+  assert.equal(blank.content, "");
+  const empty = await dispatchTool({ name: "read_file", input: { path: "x", offset: 1 }, ctx: makeCtx(), signal: undefined, fetcher: fetcherFor("") });
+  assert.match(empty.error, /past the end .*0 lines/);
+});
+
+test("read_file offset beyond a truncated head points at run_command, not the last line", async () => {
+  const { fetcher } = makeFetcher(() => ({ body: { path: "big.txt", content: "a\nb\nc", truncated: true } }));
+  const out = await dispatchTool({ name: "read_file", input: { path: "big.txt", offset: 99 }, ctx: makeCtx(), signal: undefined, fetcher });
+  assert.match(out.error, /beyond the 256 KiB readable head/);
+  assert.match(out.error, /run_command/);
+});
+
+test("edit_file forwards the replacement to the agent's atomic /edit-file", async () => {
+  const { fetcher, calls } = makeFetcher(() => ({ body: { ok: true, path: "src/x.js", replacements: 1, bytes: 42 } }));
+  const out = await dispatchTool({
+    name: "edit_file",
+    input: { path: "src/x.js", old_string: "a", new_string: "b" },
+    ctx: makeCtx(), signal: undefined, fetcher,
+  });
+  // Passed through as-is — same result shape convention as write_file.
+  assert.deepEqual(out, { ok: true, path: "src/x.js", replacements: 1, bytes: 42 });
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /\/edit-file$/);
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    sessionId: "sess-1", path: "src/x.js", old_string: "a", new_string: "b", replace_all: false,
+  });
+  assert.equal(calls[0].init.headers["X-aws-proxy-auth"], "jwe-tok");
+});
+
+test("edit_file surfaces the agent's refusal verbatim so the model can act on it", async () => {
+  const { fetcher } = makeFetcher(() => ({ ok: false, status: 422, body: { error: "old_string matches 3 places in a.txt" } }));
+  const out = await dispatchTool({
+    name: "edit_file", input: { path: "a.txt", old_string: "x", new_string: "y" },
+    ctx: makeCtx(), signal: undefined, fetcher,
+  });
+  assert.match(out.error, /matches 3 places/);
+  assert.equal(out.status, 422);
+});
+
+test("edit_file rejects bad arguments before touching the sandbox", async () => {
+  const cases = [
+    [{ path: "a", old_string: "", new_string: "y" }, /old_string required/],
+    [{ path: "a", old_string: "x" }, /new_string required/],
+    [{ path: "a", old_string: "x", new_string: "x" }, /identical/],
+    [{ old_string: "x", new_string: "y" }, /path required/],
+  ];
+  for (const [input, pattern] of cases) {
+    const { fetcher, calls } = makeFetcher(() => ({ body: {} }));
+    const out = await dispatchTool({ name: "edit_file", input, ctx: makeCtx(), signal: undefined, fetcher });
+    assert.match(out.error, pattern);
+    assert.equal(calls.length, 0, `${JSON.stringify(input)}: must not reach the agent`);
+  }
+});
+
 test("write_file POSTs JSON body to /write-file with sessionId, path, content", async () => {
   const { fetcher, calls } = makeFetcher(() => ({ body: { ok: true } }));
   await dispatchTool({

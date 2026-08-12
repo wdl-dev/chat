@@ -1,4 +1,6 @@
 import path from "node:path";
+import { promises as fs, constants as FS } from "node:fs";
+import { randomUUID } from "node:crypto";
 
 export const WORKSPACE = "/workspace";
 const SESSION_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -220,3 +222,72 @@ export const EXPORT_EXCLUDES = [
   "node_modules", ".git", ".deploy-dist", ".wrangler",
   ".env", ".env.*", ".dev.vars", ".dev.vars.*",
 ];
+
+// Open target for reading as the /edit-file source: leaf symlinks refused (this feeds a write-back,
+// unlike /read-file which deliberately follows them), O_NONBLOCK so a writer-less FIFO can't wedge
+// the open — it runs holding the session write lock, so a wedge outlives the caller's timeout and
+// jams every later file op — and the fd's realpath confined to root before anything is read.
+export async function openConfinedRegularFile(target, root) {
+  const fh = await fs.open(target, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_NONBLOCK);
+  try {
+    const real = await fs.realpath(`/proc/self/fd/${fh.fd}`);
+    if (real !== root && !real.startsWith(root + path.sep)) throw httpErr(400, "path escapes workspace");
+    const st = await fh.stat();
+    if (!st.isFile()) throw httpErr(400, "not a regular file");
+    return { fh, st };
+  } catch (err) {
+    await fh.close().catch(() => {});
+    throw err;
+  }
+}
+
+// The textual half of /edit-file, split out so it is testable without a session or a real fd.
+// split/join rather than String.replace: a newStr containing $& or $1 would otherwise be read as a
+// replacement pattern. With found === 1 the join is exactly the single-replacement case.
+export function applyEdit(content, oldStr, newStr, replaceAll, maxBytes = Infinity) {
+  const parts = content.split(oldStr);
+  const found = parts.length - 1;
+  if (found === 0) return { found: 0 };
+  if (found > 1 && !replaceAll) return { found, ambiguous: true };
+  // Size the result by arithmetic BEFORE joining: a replace_all that grows each match would
+  // otherwise have to build the oversized string in order to measure it. UTF-8 lengths are additive,
+  // so this is exact, and the source cap alone does not bound it (small file, huge newStr, N matches).
+  const bytes = Buffer.byteLength(content)
+    + found * (Buffer.byteLength(newStr) - Buffer.byteLength(oldStr));
+  if (bytes > maxBytes) return { found, oversize: true, bytes };
+  return { found, bytes, text: parts.join(newStr) };
+}
+
+// Replace dir/name's contents by staging a sibling temp file and renaming over the target. rename is
+// atomic, so a failure anywhere before it leaves the existing file exactly as it was — truncating the
+// target first would destroy it on a short write or ENOSPC. writeFile/rename also handle partial
+// writes, which a lone fh.write() does not. Mode and ownership carry over so the sandbox uid keeps
+// its access to the new inode.
+export async function replaceFileAtomically(dir, name, text, { mode, uid, gid }) {
+  // The staging name must not embed `name`: a basename can be up to 255 bytes, and appending a UUID
+  // would push a legitimately-named file past NAME_MAX (ENAMETOOLONG). The UUID alone is unique.
+  const tmp = path.join(dir, `.edit-${randomUUID()}.tmp`);
+  let fh = null;
+  let real = tmp;
+  try {
+    fh = await fs.open(tmp, FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL | FS.O_NOFOLLOW, mode);
+    // O_NOFOLLOW guards only the leaf. A dir component swapped to a symlink after the caller's
+    // realpath is still followed, landing the temp outside `dir` — verify where the fd actually
+    // landed, same as /write-file. A swap AFTER this check makes the rename below re-resolve tmp
+    // through the symlink and fail ENOENT, so nothing escapes on that side either.
+    real = await fs.realpath(`/proc/self/fd/${fh.fd}`);
+    if (path.dirname(real) !== dir) throw httpErr(400, "path escapes workspace");
+    await fh.writeFile(text);
+    await fh.chown(uid, gid);
+    // open()'s mode argument is masked by umask, so a 0666 original would come back 0644 — fchmod
+    // the verified fd to restore the mode exactly.
+    await fh.chmod(mode);
+    await fh.close();
+    fh = null;
+    await fs.rename(tmp, path.join(dir, name));
+  } catch (err) {
+    if (fh) await fh.close().catch(() => {});
+    await fs.unlink(real).catch(() => {});
+    throw err;
+  }
+}

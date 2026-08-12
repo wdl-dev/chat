@@ -12,6 +12,8 @@ const TAIL_MAX_DURATION_SEC = 60;
 const TAIL_DEFAULT_MAX_EVENTS = 200;
 const TAIL_DEFAULT_MAX_BYTES = 200_000;
 const CALL_AGENT_TIMEOUT_MS = 90_000; // wall-clock per agent call (> agent-side run 45s / pack 60s caps)
+const READ_DEFAULT_LINES = 800;
+const READ_MAX_LINES = 5000;
 const TAIL_OPEN_TIMEOUT_MS = 10_000;
 
 function clampInt(n, min, max, def) {
@@ -42,12 +44,58 @@ async function callAgent(ctx, path, init, fetcher) {
   return { ok: res.ok, status: res.status, data };
 }
 
+// Window content by 1-based line numbers. Counting matches wc -l: a trailing newline terminates the
+// last line rather than starting a phantom empty one ("a\n\n" is two lines, the second empty; an
+// empty file is zero). An offset past the end is an explicit error, not a clamp — a paginator
+// stepping offset += limit would otherwise re-receive the last line forever, with no total to stop
+// on when the read was truncated. On a truncated read the numbers describe the 256 KiB head, so
+// total is omitted rather than contradicted by the rest of the file.
+function lineWindow(data, path, offset, limit) {
+  const all = data.content.split("\n");
+  if (all.at(-1) === "") all.pop();
+  const available = all.length;
+  const from = clampInt(offset, 1, Infinity, 1);
+  if (from > available) {
+    return data.truncated
+      ? { error: `offset ${from} is beyond the 256 KiB readable head of ${path} (${available} lines readable) — use run_command (sed / awk / node) to read past it` }
+      : { error: `offset ${from} is past the end of ${path} (${available} lines)` };
+  }
+  const to = Math.min(available, from - 1 + clampInt(limit, 1, READ_MAX_LINES, READ_DEFAULT_LINES));
+  const lines = data.truncated ? { from, to } : { from, to, total: available };
+  return { ...data, content: all.slice(from - 1, to).join("\n"), lines };
+}
+
 async function readFile(ctx, input, signal, fetcher) {
   if (typeof input?.path !== "string") return { error: "path required" };
   const { ok, status, data } = await callAgent(ctx,
     `/read-file?sessionId=${encodeURIComponent(ctx.sessionId)}&path=${encodeURIComponent(input.path)}`,
     { headers: agentAuthHeader(ctx), signal }, fetcher);
-  return ok ? data : { error: data?.error ?? `read-file http ${status}`, status };
+  if (!ok) return { error: data?.error ?? `read-file http ${status}`, status };
+  const windowed = (input.offset !== undefined || input.limit !== undefined) && typeof data.content === "string";
+  return windowed ? lineWindow(data, input.path, input.offset, input.limit) : data;
+}
+
+// Not idempotent — a new_string containing old_string would apply twice on replay, so edit_file
+// must stay out of REPLAY_SAFE_TOOLS.
+async function editFile(ctx, input, signal, fetcher) {
+  if (typeof input?.path !== "string") return { error: "path required" };
+  if (typeof input?.old_string !== "string" || input.old_string === "") return { error: "old_string required" };
+  if (typeof input?.new_string !== "string") return { error: "new_string required" };
+  if (input.old_string === input.new_string) return { error: "old_string and new_string are identical" };
+
+  const { ok, status, data } = await callAgent(ctx, "/edit-file", {
+    method: "POST",
+    headers: agentHeaders(ctx),
+    body: JSON.stringify({
+      sessionId: ctx.sessionId,
+      path: input.path,
+      old_string: input.old_string,
+      new_string: input.new_string,
+      replace_all: input.replace_all === true,
+    }),
+    signal,
+  }, fetcher);
+  return ok ? data : { error: data?.error ?? `edit-file http ${status}`, status };
 }
 
 async function writeFile(ctx, input, signal, fetcher) {
@@ -792,6 +840,7 @@ async function webFetch(ctx, input, parentSignal, fetcher) {
 const REGISTRY = {
   read_file:    readFile,
   write_file:   writeFile,
+  edit_file:    editFile,
   list_files:   listFiles,
   run_command:  runCommand,
   deploy_test:  deployTest,

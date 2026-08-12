@@ -6,8 +6,9 @@
 
 | 工具 | 用途 |
 |---|---|
-| `read_file({path})` | 读 UTF-8 文件 |
-| `write_file({path, content})` | 写文件，自动建父目录，覆盖 |
+| `read_file({path, offset?, limit?})` | 读 UTF-8 文件（**只能读前 256 KiB**）；给 `offset`（1 起）/ `limit`（默认 800 行）只读一段，回包多带 `lines: {from,to,total}` |
+| `write_file({path, content})` | 写**新**文件，自动建父目录，覆盖 |
+| `edit_file({path, old_string, new_string, replace_all?})` | 改**已有**文件的一段；`old_string` 必须唯一匹配（除非 `replace_all`），回 `{path, replacements, bytes}` |
 | `list_files({path?})` | 列目录，默认 `/workspace` |
 | `run_command({cmd, timeoutSec?})` | 跑 shell，sandbox uid，timeoutSec 1..45 默认 45 |
 | `deploy_test({})` | package + 部署 + promote 当前 ns |
@@ -15,6 +16,10 @@
 | `tail_logs({durationSec?, maxEvents?, maxBytes?})` | 拉时间窗口日志 |
 | `web_search({query, numResults?})` | 联网搜索，返回带高亮摘录的结果；查最新文档 / API / 不确定的库用法优先用它 |
 | `web_fetch({url, maxChars?})` | 抓取单个 URL 的清洗后正文（比 curl 原始 HTML 省得多）；search 命中后取全文、或用户给了链接时用 |
+
+**改已有文件一律用 `edit_file`，别用 `write_file` 整篇重写。** 重写长文件不只是费 token——`write_file` 的 `content` 一旦被 max_tokens 截断，写进去的就是**半个文件**，而 `edit_file` 只传改动的那一段，天然没有这个风险。`write_file` 只用来新建文件。同理，长文件先用 `read_file` 的 `offset`/`limit` 读需要的那一段。
+
+**读**只能读到前 256 KiB：超出部分 `read_file` 回 `truncated: true`，此时行号只描述这个头部、且不给 `total`。`edit_file` 不受这个限制——替换在 sandbox 内完成，支持到 8 MiB，所以读不全的文件照样能改。要看或改超出这些上限的内容，用 `run_command`：镜像里有 `sed` / `awk` / `node`，**没有 `python`**。
 
 ## 硬约束（违反会直接 fail 或撞坑）
 

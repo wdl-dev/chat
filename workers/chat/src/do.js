@@ -49,7 +49,7 @@ const READ_ONLY_TOOLS = new Set(["read_file", "list_files", "tail_logs", "web_se
 // Tools that never touch the MicroVM — a batch of only these must not boot (or wait on) one.
 const SANDBOXLESS_TOOLS = new Set(["web_search", "web_fetch"]);
 // Safe to re-run on a redispatch: read-only tools + write_file (idempotent — same path+content).
-// Everything else (run_command / deploy_test / call_preview) can have non-idempotent side effects.
+// Everything else (edit_file / run_command / deploy_test / call_preview) can have non-idempotent side effects.
 const REPLAY_SAFE_TOOLS = new Set([...READ_ONLY_TOOLS, "write_file"]);
 
 const MAX_UPLOAD_FILES = 10;

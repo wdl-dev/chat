@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, readdirSync, statSync, chmodSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,6 +9,9 @@ import {
   SANDBOX_USER,
   WORKSPACE,
   appendCapped,
+  applyEdit,
+  openConfinedRegularFile,
+  replaceFileAtomically,
   buildChildEnv,
   exportFilename,
   makeCappedSink,
@@ -349,4 +352,137 @@ test("EXPORT_EXCLUDES drops secret files at any depth from a tar export", () => 
     rmSync(dir, { recursive: true, force: true });
     rmSync(`${dir}.tgz`, { force: true });
   }
+});
+
+test("applyEdit replaces a unique match and reports the count", () => {
+  const r = applyEdit("const a = 1;\nconst b = 2;\n", "const b = 2;", "const b = 3;", false);
+  assert.deepEqual(r, { found: 1, bytes: 26, text: "const a = 1;\nconst b = 3;\n" });
+});
+
+test("applyEdit reports a missing match and an ambiguous one without producing text", () => {
+  assert.deepEqual(applyEdit("x\nx\n", "nope", "y", false), { found: 0 });
+  assert.deepEqual(applyEdit("x\nx\n", "x", "y", false), { found: 2, ambiguous: true });
+  assert.deepEqual(applyEdit("x\nx\n", "x", "y", true), { found: 2, bytes: 4, text: "y\ny\n" });
+});
+
+test("applyEdit writes $-sequences literally", () => {
+  const r = applyEdit("s.replace(/x/, TOKEN);", "TOKEN", '"$& $1 $`"', false);
+  assert.equal(r.text, 's.replace(/x/, "$& $1 $`");');
+});
+
+test("applyEdit refuses an edit whose result would exceed maxBytes", () => {
+  // replace_all inflates: the SOURCE is tiny, so a source-size cap alone would let this through.
+  const content = "x".repeat(1000);
+  const r = applyEdit(content, "x", "y".repeat(10_000), true, 8 * 1024 * 1024);
+  assert.equal(r.oversize, true);
+  assert.equal(r.found, 1000);
+  assert.equal(r.bytes, 10_000_000);
+  assert.equal(r.text, undefined, "must not build the oversized string just to measure it");
+});
+
+test("applyEdit sizes the result in UTF-8 bytes, including multi-byte replacements", () => {
+  // 值 is 3 bytes in UTF-8: measuring in string length would under-count and let an oversize through.
+  const r = applyEdit("a-a", "a", "值", true);
+  assert.equal(r.text, "值-值");
+  assert.equal(r.bytes, Buffer.byteLength("值-值"));
+  assert.equal(applyEdit("a-a", "a", "值", true, 6).oversize, true);
+});
+
+test("replaceFileAtomically swaps contents in place, preserving mode", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "atomic-"));
+  try {
+    const target = join(dir, "f.txt");
+    writeFileSync(target, "old", { mode: 0o640 });
+    const before = statSync(target);
+    await replaceFileAtomically(dir, "f.txt", "new contents", {
+      mode: before.mode & 0o777, uid: before.uid, gid: before.gid,
+    });
+    assert.equal(readFileSync(target, "utf8"), "new contents");
+    assert.equal(statSync(target).mode & 0o777, 0o640);
+    // The staging file must not survive a success.
+    assert.deepEqual(readdirSync(dir), ["f.txt"]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("replaceFileAtomically leaves the original intact when the write path fails", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "atomic-"));
+  try {
+    const target = join(dir, "f.txt");
+    writeFileSync(target, "original");
+    // chown to root fails for a non-root test process — stands in for any mid-write failure
+    // (ENOSPC, I/O error). Truncate-then-write would already have destroyed the file by here.
+    await assert.rejects(() => replaceFileAtomically(dir, "f.txt", "replacement", { mode: 0o644, uid: 0, gid: 0 }));
+    assert.equal(readFileSync(target, "utf8"), "original");
+    assert.deepEqual(readdirSync(dir), ["f.txt"], "temp file must be cleaned up on failure");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("replaceFileAtomically restores a mode umask would have masked off", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "atomic-"));
+  try {
+    for (const mode of [0o666, 0o664]) {
+      const target = join(dir, "f.txt");
+      writeFileSync(target, "old");
+      chmodSync(target, mode);
+      const before = statSync(target);
+      assert.equal(before.mode & 0o777, mode, "precondition: chmod is not itself masked");
+      await replaceFileAtomically(dir, "f.txt", "new", { mode, uid: before.uid, gid: before.gid });
+      assert.equal(statSync(target).mode & 0o777, mode, `mode ${mode.toString(8)} must survive the swap`);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("replaceFileAtomically handles a basename at the filesystem limit", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "atomic-"));
+  try {
+    // A staging name built from the original would blow past NAME_MAX (255) once a UUID is appended.
+    const name = "a".repeat(230) + ".txt";
+    writeFileSync(join(dir, name), "old");
+    const before = statSync(join(dir, name));
+    await replaceFileAtomically(dir, name, "new", { mode: before.mode & 0o777, uid: before.uid, gid: before.gid });
+    assert.equal(readFileSync(join(dir, name), "utf8"), "new");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("replaceFileAtomically rejects a dir reached through a symlink and leaves no temp behind", async () => {
+  const base = mkdtempSync(join(tmpdir(), "atomic-"));
+  try {
+    // Models the TOCTOU swap: the verified dir path now resolves elsewhere.
+    mkdirSync(join(base, "realdir"));
+    writeFileSync(join(base, "realdir", "f.txt"), "original");
+    symlinkSync(join(base, "realdir"), join(base, "swapped"));
+    await assert.rejects(
+      () => replaceFileAtomically(join(base, "swapped"), "f.txt", "evil", { mode: 0o644, uid: process.getuid(), gid: process.getgid() }),
+      /escapes workspace/,
+    );
+    assert.equal(readFileSync(join(base, "realdir", "f.txt"), "utf8"), "original");
+    assert.deepEqual(readdirSync(join(base, "realdir")), ["f.txt"], "temp must be cleaned from the REAL dir");
+  } finally { rmSync(base, { recursive: true, force: true }); }
+});
+
+// timeout: the regression this guards is a HANG (blocking open on a writer-less FIFO while holding
+// the session write lock), which without the cap would wedge the whole test run, not fail it.
+test("openConfinedRegularFile refuses a writer-less FIFO instead of blocking on it", { timeout: 5000 }, async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "confine-")));
+  try {
+    execFileSync("mkfifo", [join(dir, "pipe")]);
+    await assert.rejects(() => openConfinedRegularFile(join(dir, "pipe"), dir), /not a regular file/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("openConfinedRegularFile returns fh+st for a regular file and refuses a leaf symlink", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "confine-")));
+  try {
+    writeFileSync(join(dir, "f.txt"), "hi");
+    const { fh, st } = await openConfinedRegularFile(join(dir, "f.txt"), dir);
+    try {
+      assert.equal(st.size, 2);
+      assert.equal((await fh.readFile()).toString(), "hi");
+    } finally { await fh.close(); }
+    // Unlike /read-file, the edit source must not be reached through a leaf symlink (ELOOP).
+    symlinkSync(join(dir, "f.txt"), join(dir, "ln"));
+    await assert.rejects(() => openConfinedRegularFile(join(dir, "ln"), dir), (e) => e.code === "ELOOP");
+    // A path THROUGH a regular file — the codes the handler maps to actionable 400s must survive.
+    await assert.rejects(() => openConfinedRegularFile(join(dir, "f.txt", "sub.js"), dir), (e) => e.code === "ENOTDIR");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

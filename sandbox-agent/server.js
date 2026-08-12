@@ -8,6 +8,9 @@ import {
   WORKSPACE,
   SANDBOX_USER,
   appendCapped,
+  applyEdit,
+  openConfinedRegularFile,
+  replaceFileAtomically,
   buildChildEnv,
   EXPORT_EXCLUDES,
   exportFilename,
@@ -26,6 +29,9 @@ const PORT = Number(process.env.PORT ?? 8080);
 const MAX_OUTPUT = 5 * 1024 * 1024;
 const MAX_BODY = 32 * 1024 * 1024;
 const MAX_READ_FILE_BYTES = 256 * 1024;   // read_file head cap (tool_result is 256KB-capped downstream anyway)
+// edit_file rewrites the whole file, so it is bounded by VM memory rather than by what the model can
+// read — the head cap above must not apply here or the tail would be truncated away.
+const MAX_EDIT_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_LIST_ENTRIES = 1000;
 const PACK_TIMEOUT_MS = 60_000;
 // Inbound traffic is JWE-authed by the Lambda proxy; agent does no token check.
@@ -245,6 +251,58 @@ async function handleWriteFile(body) {
   return result;
 }
 
+// Read, replace and store within one request holding the session write lock, so the bytes replaced
+// are the bytes on disk at replace time — a separate /read-file + /write-file pair drops the lock in
+// between and lets an /upload or /run landing mid-edit be overwritten by a stale snapshot.
+async function handleEditFile(body) {
+  const s = requireSession(body?.sessionId);
+  const { abs, presented, root: sdir } = resolveWorkspacePath(body?.path, s.sessionId);
+  const oldStr = body?.old_string, newStr = body?.new_string;
+  if (typeof oldStr !== "string" || oldStr === "") throw httpErr(400, "old_string must be a non-empty string");
+  if (typeof newStr !== "string") throw httpErr(400, "new_string must be a string");
+
+  // realWithin is inside the error mapping too: a missing or non-dir PARENT surfaces there, not at
+  // open. These are deterministic path errors — a raw 500 reads as a transient sandbox fault and
+  // invites retries.
+  let realDir, opened;
+  try {
+    realDir = await realWithin(path.dirname(abs), sdir);
+    opened = await openConfinedRegularFile(path.join(realDir, path.basename(abs)), sdir);
+  } catch (e) {
+    if (e?.code === "ENOENT") throw httpErr(400, `${presented} does not exist — use write_file to create it`);
+    if (e?.code === "ELOOP") throw httpErr(400, `${presented} is a symlink — edit_file refuses symlinks; resolve it (run_command: readlink) and edit the target path`);
+    if (e?.code === "ENOTDIR") throw httpErr(400, `${presented} is not a valid path — a parent component is a regular file, not a directory`);
+    throw e;
+  }
+  const { fh, st } = opened;
+  let content;
+  try {
+    if (st.size > MAX_EDIT_FILE_BYTES) {
+      throw httpErr(413, `${presented} is ${st.size} bytes, over the ${MAX_EDIT_FILE_BYTES}-byte edit limit — change it with run_command instead`);
+    }
+    const buf = await fh.readFile(); // reads to EOF; a single fh.read() may return a short count
+    content = buf.toString("utf8");
+    // A lossy decode means this isn't UTF-8 text; writing the re-encoded string back would corrupt it.
+    if (!Buffer.from(content, "utf8").equals(buf)) throw httpErr(400, `${presented} is not a UTF-8 text file`);
+  } finally { await fh.close(); }
+
+  const edit = applyEdit(content, oldStr, newStr, body?.replace_all === true, MAX_EDIT_FILE_BYTES);
+  if (edit.found === 0) {
+    throw httpErr(422, `old_string not found in ${presented} — it must match exactly, including indentation and line breaks`);
+  }
+  if (edit.ambiguous) {
+    throw httpErr(422, `old_string matches ${edit.found} places in ${presented} — include surrounding context to make it unique, or set replace_all: true`);
+  }
+  if (edit.oversize) {
+    throw httpErr(413, `that edit would grow ${presented} to ${edit.bytes} bytes, over the ${MAX_EDIT_FILE_BYTES}-byte edit limit`);
+  }
+
+  await replaceFileAtomically(realDir, path.basename(abs), edit.text, {
+    mode: st.mode & 0o777, uid: st.uid, gid: st.gid,
+  });
+  return { ok: true, path: presented, replacements: edit.found, bytes: edit.bytes };
+}
+
 async function handleReadFile(query) {
   const s = requireSession(query.sessionId);
   const { abs, presented, root } = resolveReadablePath(query.path, s.sessionId);
@@ -457,6 +515,10 @@ async function dispatch(req, url) {
     case "POST /write-file": {
       const body = await readJson(req);
       return sessionLock.write(requireSession(body?.sessionId).sessionId, () => handleWriteFile(body));
+    }
+    case "POST /edit-file": {
+      const body = await readJson(req);
+      return sessionLock.write(requireSession(body?.sessionId).sessionId, () => handleEditFile(body));
     }
     case "GET /read-file": {
       const q = Object.fromEntries(url.searchParams);

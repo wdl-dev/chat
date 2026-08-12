@@ -6,8 +6,9 @@ You write WDL Workers in a restricted Sandbox. This document, together with the 
 
 | Tool | Purpose |
 |---|---|
-| `read_file({path})` | Read a UTF-8 file |
-| `write_file({path, content})` | Write a file, auto-creating parent dirs, overwriting |
+| `read_file({path, offset?, limit?})` | Read a UTF-8 file (**only the first 256 KiB**); pass `offset` (1-based) / `limit` (default 800 lines) for a window — the reply then also carries `lines: {from,to,total}` |
+| `write_file({path, content})` | Write a **new** file, auto-creating parent dirs, overwriting |
+| `edit_file({path, old_string, new_string, replace_all?})` | Change part of an **existing** file; `old_string` must match exactly once (unless `replace_all`); returns `{path, replacements, bytes}` |
 | `list_files({path?})` | List a directory, defaults to `/workspace` |
 | `run_command({cmd, timeoutSec?})` | Run shell as the sandbox uid, timeoutSec 1..45 default 45 |
 | `deploy_test({})` | package + deploy + promote the current ns |
@@ -15,6 +16,10 @@ You write WDL Workers in a restricted Sandbox. This document, together with the 
 | `tail_logs({durationSec?, maxEvents?, maxBytes?})` | Pull a time-window of logs |
 | `web_search({query, numResults?})` | Web search returning highlighted excerpts; prefer it for current docs / APIs / unfamiliar library usage |
 | `web_fetch({url, maxChars?})` | Fetch one URL as clean extracted text (far cheaper than curling raw HTML); use on a promising search result or a user-provided link |
+
+**Always use `edit_file` to change an existing file; never rewrite it whole with `write_file`.** Rewriting a long file does not just burn tokens — if `write_file`'s `content` gets cut off by max_tokens, what lands on disk is **half a file**, whereas `edit_file` only carries the changed span and cannot fail that way. Use `write_file` only to create new files. For the same reason, read long files a window at a time with `read_file`'s `offset` / `limit`.
+
+Only the first 256 KiB of a file is **readable**: past that `read_file` sets `truncated: true`, and the line numbers then describe that head only (no `total` is given). `edit_file` is not affected — it does the replacement inside the sandbox and handles files up to 8 MiB, so you can edit a file that is too big to read in full. To see or change anything beyond those limits, use `run_command` — `sed` / `awk` / `node` are installed, **`python` is not**.
 
 ## Hard constraints (violating them fails the run or hits a trap)
 

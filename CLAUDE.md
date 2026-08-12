@@ -60,7 +60,7 @@ chat-worker lazily opens a MicroVM on the first tool use: `_ensureSandbox()` cal
 polls it to RUNNING, mints a short-lived JWE, pushes the session info to the agent's
 `/init`, and returns `{ microvmId, endpoint, authToken, authTokenExpiresAt }` (stored in
 session_meta). chat-worker then talks to the MicroVM's **public HTTPS endpoint** directly
-(`https://<endpoint>/{run,write-file,read-file,list-files,package,export}` with the
+(`https://<endpoint>/{run,write-file,edit-file,read-file,list-files,package,export}` with the
 `X-aws-proxy-auth` JWE), refreshing the JWE via `mintToken` near expiry. `requestClose`
 calls `closeSession` (terminate, idempotent). There is no pool, no lease, no mesh, no
 self-registration — each session gets its own ephemeral VM and its `/workspace` dies with
@@ -207,6 +207,31 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   during the wait aborts via `_wakePlanWait` + a post-wait cancel-check.
 - **`tool_result` content is capped at 256 KB** (head+tail, `capText`) so a large
   `run_command` / `read_file` output can't overflow the model context or poison later turns.
+- **`edit_file` does its replacement on the agent, not in chat-worker** — `POST /edit-file` reads,
+  replaces and stores **within one request holding the session write lock**, so the bytes replaced are
+  the bytes on disk at replace time. The store itself goes through `replaceFileAtomically`: a sibling
+  temp file, then `rename` (atomic), carrying mode/uid/gid over — truncating the target first would
+  destroy it on a short write or ENOSPC, and `rename` swaps the inode so ownership must be restored
+  or the sandbox uid loses write access. The temp open re-verifies its fd's realpath like
+  `/write-file` does (`O_NOFOLLOW` guards only the leaf — a racing dir→symlink swap by the sandbox
+  uid would otherwise land a root-written file outside the workspace). The result size is checked by byte arithmetic *before* the
+  join, since `replace_all` can inflate a small file past the cap. The first version composed `/read-file` + `/write-file` from
+  chat-worker and was wrong twice over: `/read-file` caps at 256 KiB (sound for *showing* a file to
+  the model, silent data loss for read-modify-write — writing that head back deleted everything past
+  it), and nothing held a lock between the two calls, so an `/upload` (which writes `assets/` straight
+  from the router, outside the tool batch that serial dispatch orders) could be clobbered by the stale
+  snapshot. Neither is fixable in chat-worker. Consequences: **editing needs an image rebuild before
+  the chat-worker deploy**, `edit_file` handles files up to `MAX_EDIT_FILE_BYTES` (8 MiB) including
+  ones `read_file` can't return in full, and it rejects a file whose bytes don't survive a UTF-8
+  round-trip rather than corrupting it. Replacement is split/join, never `String.replace`, so a
+  `new_string` holding `$&` / `$1` is written literally. Still not idempotent (a `new_string`
+  containing `old_string` applies twice), so it stays out of `REPLAY_SAFE_TOOLS`.
+  `edit_file` exists because rewriting a whole file to change a few lines burns output tokens and,
+  worse, a `write_file` whose `content` is cut off by max_tokens lands **half a file** on disk.
+  `read_file` takes optional `offset`/`limit` for the same reason — window a long file instead of
+  paying `capText` truncation. Windowing happens in chat-worker after the full read, so it saves
+  model tokens, not VM transfer, and on a `truncated` read it omits `lines.total` rather than
+  reporting a total the rest of the file contradicts.
 - **`run_command` timeoutSec is capped at 45s** (`RUN_COMMAND_TIMEOUT_CAP_SEC`). sandbox-agent
   kills the child at the cap so a hung command returns cleanly instead of the inbound
   MicroVM request hanging. AI-supplied values above 45 silently clamp.
@@ -359,7 +384,7 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   the ap-east-1 egress is probe-verified.
 - **Parallel read-only tool dispatch.** Contiguous read-only tool_uses (`read_file` /
   `list_files` / `tail_logs` / `web_search` / `web_fetch`, in `READ_ONLY_TOOLS`) run in a Promise.all batch with one
-  shared AbortController. Effectful tools (`write_file` / `run_command` / `deploy_test` /
+  shared AbortController. Effectful tools (`write_file` / `edit_file` / `run_command` / `deploy_test` /
   `call_preview`) stay serial because of the sandbox mutex and ordering.
 - **ASSETS-first guidance is a hard rule in the system prompt (promptPack) + AGENTS.md.** Without it the
   model inlines whole HTML strings in `return new Response('<html>...')`, blowing

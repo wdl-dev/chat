@@ -3,18 +3,27 @@
 export const TOOL_DEFINITIONS = [
   {
     name: "read_file",
-    description: "Read a UTF-8 text file under /workspace. Returns { path, content }.",
+    description:
+      "Read a UTF-8 text file under /workspace. Returns { path, content }. " +
+      "Pass offset/limit to read a line window instead of the whole file; the reply then also carries " +
+      "{ lines: { from, to, total } }. Only the first 256 KiB of a file is readable: past that the reply " +
+      "sets truncated:true, line numbers describe that head only, and total is omitted — use run_command " +
+      "(sed / awk / node) to reach the rest.",
     input_schema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Path relative to /workspace, or beginning with /workspace/." },
+        path:   { type: "string", description: "Path relative to /workspace, or beginning with /workspace/." },
+        offset: { type: "integer", description: "Optional 1-based first line to return." },
+        limit:  { type: "integer", description: "Optional number of lines to return (default 800, max 5000)." },
       },
       required: ["path"],
     },
   },
   {
     name: "write_file",
-    description: "Write a UTF-8 text file under /workspace. Creates parent directories. Overwrites.",
+    description:
+      "Write a UTF-8 text file under /workspace. Creates parent directories. Overwrites. " +
+      "Use edit_file to change part of an existing file — rewriting a whole file to change a few lines wastes output tokens and risks truncation.",
     input_schema: {
       type: "object",
       properties: {
@@ -22,6 +31,25 @@ export const TOOL_DEFINITIONS = [
         content: { type: "string", description: "File contents (UTF-8)." },
       },
       required: ["path", "content"],
+    },
+  },
+  {
+    name: "edit_file",
+    description:
+      "Replace an exact string in an existing file under /workspace. Returns { path, replacements, bytes }. " +
+      "old_string must appear exactly once unless replace_all is true — include surrounding lines to make it unique. " +
+      "Preferred over write_file for any change to a file that already exists. " +
+      "The replacement runs inside the sandbox on the file as it is on disk, and handles files up to 8 MiB — " +
+      "including ones too large for read_file to return in full.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path:        { type: "string", description: "Path under /workspace." },
+        old_string:  { type: "string", description: "Exact text to replace, including indentation and line breaks." },
+        new_string:  { type: "string", description: "Replacement text." },
+        replace_all: { type: "boolean", description: "Replace every occurrence instead of requiring a unique match." },
+      },
+      required: ["path", "old_string", "new_string"],
     },
   },
   {
@@ -124,7 +152,7 @@ export const TOOL_DEFINITIONS = [
 
 const ZH = {
   system: `你在 WDL Sandbox 里写 Worker。WDL 是自托管的多租户 Workers 运行时 + 控制面：你写 Workers 形态的代码（wrangler 配置 + workerd 引擎），跑在 Cloudflare 之外，部署 / 绑定 / ACL 都由 WDL 自己管。WDL 由 WDL Team 开发、以 Apache-2.0 开源在 github.com/wdl-dev —— 介绍 / 署名平台时用这个，别提任何公司名。
-你的 shell cwd 已经是项目根（\`pwd\` 可能显示 \`/workspace/<token>/\` 之类，以下文档统一称 \`/workspace\`）。**永远不要 cd 到别处、不要 mkdir 子项目目录**（deploy_test 只 package 项目根），也**不要操作 \`/workspace\` 绝对路径**（\`cd /workspace\` / \`ls /workspace\` 会撞 0711 权限）；用 \`read_file\` / \`write_file\` / \`list_files\` 工具或纯相对路径。\`$WDL_NS\` 已注入子进程。详见 AGENTS.md。
+你的 shell cwd 已经是项目根（\`pwd\` 可能显示 \`/workspace/<token>/\` 之类，以下文档统一称 \`/workspace\`）。**永远不要 cd 到别处、不要 mkdir 子项目目录**（deploy_test 只 package 项目根），也**不要操作 \`/workspace\` 绝对路径**（\`cd /workspace\` / \`ls /workspace\` 会撞 0711 权限）；用 \`read_file\` / \`write_file\` / \`edit_file\` / \`list_files\` 工具或纯相对路径。\`$WDL_NS\` 已注入子进程。详见 AGENTS.md。
 
 # 平台能力
 
@@ -148,7 +176,7 @@ const ZH = {
 
 1. \`wdl init . --ns "$WDL_NS" --worker app\` —— scaffold 标准 wrangler 项目（首次会话）；**必须传 \`--worker app\`**，sandbox 总是以 \`app\` 为 worker 名 deploy
 2. **\`read_file /workspace/AGENTS.md\`** —— Sandbox 专属手册，init 之后由 chat-worker 改写成权威版本。装包 / 部署 / 资源 provisioning / wrangler 配置等细节都在那里，以它为准。
-3. \`write_file\` 写代码
+3. \`write_file\` 新建文件写代码；**改已有文件用 \`edit_file\`**（精确替换，别整篇重写——重写既费 token，被 max_tokens 截断还会把文件写成半个）
 4. **\`deploy_test\`** 部署
 5. **\`call_preview\`** 调试（默认带日志捕获，一次拿响应 + worker console）；需要持续观察用 \`tail_logs\`
 
@@ -225,7 +253,7 @@ const ZH = {
 
 const EN = {
   system: `You write Workers in the WDL Sandbox. WDL is a self-hosted, multi-tenant Workers runtime + control plane: you write Workers-style code (wrangler config + the workerd engine) that runs outside Cloudflare, and WDL itself owns deploy / bindings / ACL. WDL is built by the WDL Team and open source under Apache-2.0 at github.com/wdl-dev — use that when introducing / attributing the platform, and never name a company.
-Your shell cwd is already the project root (\`pwd\` may show something like \`/workspace/<token>/\`; the docs below call it \`/workspace\` everywhere). **Never cd elsewhere, never mkdir a subproject dir** (deploy_test only packages the project root), and **never touch the \`/workspace\` absolute path** (\`cd /workspace\` / \`ls /workspace\` hit 0711 permissions); use the \`read_file\` / \`write_file\` / \`list_files\` tools or plain relative paths. \`$WDL_NS\` is injected into subprocesses. See AGENTS.md.
+Your shell cwd is already the project root (\`pwd\` may show something like \`/workspace/<token>/\`; the docs below call it \`/workspace\` everywhere). **Never cd elsewhere, never mkdir a subproject dir** (deploy_test only packages the project root), and **never touch the \`/workspace\` absolute path** (\`cd /workspace\` / \`ls /workspace\` hit 0711 permissions); use the \`read_file\` / \`write_file\` / \`edit_file\` / \`list_files\` tools or plain relative paths. \`$WDL_NS\` is injected into subprocesses. See AGENTS.md.
 
 # Platform capabilities
 
@@ -249,7 +277,7 @@ No summary = not done.
 
 1. \`wdl init . --ns "$WDL_NS" --worker app\` — scaffold a standard wrangler project (first session); **you must pass \`--worker app\`**, the sandbox always deploys under the worker name \`app\`
 2. **\`read_file /workspace/AGENTS.md\`** — the sandbox-specific manual, rewritten to the authoritative version by chat-worker after init. Packaging / deploy / resource provisioning / wrangler config details live there; treat it as the source of truth.
-3. \`write_file\` to write code
+3. \`write_file\` to create files; **change an existing file with \`edit_file\`** (exact replacement — never rewrite it whole: that burns tokens and, cut off by max_tokens, lands half a file on disk)
 4. **\`deploy_test\`** to deploy
 5. **\`call_preview\`** to debug (captures logs by default — response + worker console in one call); for continuous watching use \`tail_logs\`
 
