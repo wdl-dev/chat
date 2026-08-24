@@ -86,7 +86,9 @@ You need two credentials from your WDL platform operator: (1) a normal per-ns to
    echo -n <key> | wdl secret put AWS_SECRET_ACCESS_KEY --worker sandbox-broker --ns demo
    echo -n <arn> | wdl secret put MICROVM_IMAGE_ARN --worker sandbox-broker --ns demo  # name-based ARN, see "built separately" below
 3. set chat-worker secrets (--worker chat-worker --ns demo):
-   OPERATOR_TOKEN / LLM_API_KEY / ADMIN_URL / DEMO_PASSCODE   (TOKEN_ISSUER_TOKEN was set in step 1)
+   LLM_API_KEY / ADMIN_URL / DEMO_PASSCODE   (TOKEN_ISSUER_TOKEN was set in step 1)
+   # OPERATOR_TOKEN (optional) gates only POST /admin/sessions/<id>/force-close; leave it unset —
+   # the route then fails closed, and a stuck session still ends via the user's Close or the 6h deadline.
    # EXA_API_KEY (optional) backs the web_search / web_fetch tools; unset, they answer "not configured".
    # LLM_API_KEY must match the default provider (DeepSeek, Anthropic wire). For a different
    # provider set the whole LLM_* group together: LLM_API_SHAPE / LLM_BASE_URL / LLM_MODEL /

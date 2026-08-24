@@ -487,11 +487,23 @@ function buildPreviewUrl(ns, platformDomain) {
   return `https://${ns}.${platformDomain}/${FIXED_WORKER_NAME}/`;
 }
 
-function summarizeArtifact(artifact) {
+function canonicalJson(value) {
+  return JSON.stringify(value, (_key, nested) => {
+    if (nested === null || typeof nested !== "object" || Array.isArray(nested)) return nested;
+    return Object.fromEntries(Object.keys(nested).sort().map(key => [key, nested[key]]));
+  });
+}
+
+async function summarizeArtifact(artifact) {
   const modules = artifact?.modules ?? {};
   const assets = artifact?.assets ?? {};
+  const digest = await crypto.subtle.digest(
+    "SHA-256", new TextEncoder().encode(canonicalJson(artifact)),
+  );
   return {
-    modulePaths: Object.keys(modules),
+    artifactDigest: [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join(""),
+    modulePaths: Object.keys(modules).sort(),
+    assetPaths: Object.keys(assets).sort(),
     assetCount: Object.keys(assets).length,
     mainModule: artifact?.mainModule ?? null,
   };
@@ -510,6 +522,9 @@ async function deployTest(ctx, _input, signal, fetcher) {
     return { error: pkg.data?.error ?? `package http ${pkg.status}`, status: pkg.status, upstream: pkg.data?.stderr };
   }
   const artifact = pkg.data;
+  // Hash the complete JSON artifact sent to control. Canonical key ordering makes repeated packs
+  // of identical deployable content compare equal even if object insertion order changes.
+  const artifactMeta = await summarizeArtifact(artifact);
 
   const headers = { "content-type": "application/json", "x-admin-token": ctx.nsToken };
   const nsEnc = encodeURIComponent(ctx.ns);
@@ -541,9 +556,20 @@ async function deployTest(ctx, _input, signal, fetcher) {
     warnings.push("session_policy: restart was not confirmed on promote — old Durable Object facets and WebSockets may still be running the previous version.");
   }
 
+  // After a redeploy, models reliably re-verify only what they just changed, and a static rule in
+  // AGENTS.md does not fix that — a reminder in the tool result lands at the exact moment the
+  // stale-verification decision is being made, which is the strongest lever short of code.
+  const isRedeploy = Boolean(ctx.previewUrl());
   const previewUrl = buildPreviewUrl(ctx.ns, prom.json.platformDomain ?? ctx.env.PLATFORM_DOMAIN);
   if (previewUrl) ctx.setPreviewUrl(previewUrl);
-  return { versionId: version, previewUrl, warnings, artifactMeta: summarizeArtifact(artifact) };
+  // The model sees the pre-digest shape; artifactDigest/assetPaths ride the "_" machine-only
+  // channel (stripped by toolResultBlock) to the preview.ready broadcast for the bench.
+  const { artifactDigest, assetPaths, ...modelMeta } = artifactMeta;
+  const out = { versionId: version, previewUrl, warnings, artifactMeta: modelMeta, _artifactMeta: artifactMeta };
+  if (isRedeploy) {
+    out.reverify = "This deploy REPLACED the served version: every call_preview result from before it is stale. Re-verify ALL endpoints against this version now — not only the one you changed — creating a temporary record for side-effecting routes instead of touching existing data.";
+  }
+  return out;
 }
 
 // Waits for tail's XREAD cursor to land, then for async console events to flush.
@@ -856,4 +882,4 @@ export async function dispatchTool({ name, input, ctx, signal, fetcher = fetch, 
   return await handler(ctx, input, signal, fetcher, sleep);
 }
 
-export const __test__ = { parseSseBlock, drainTailSse, clampInt, runsWdlInitCommand };
+export const __test__ = { parseSseBlock, drainTailSse, clampInt, runsWdlInitCommand, summarizeArtifact };

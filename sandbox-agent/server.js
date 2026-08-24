@@ -9,7 +9,8 @@ import {
   SANDBOX_USER,
   appendCapped,
   applyEdit,
-  openConfinedRegularFile,
+  openConfinedDir,
+  openRegularFileAt,
   replaceFileAtomically,
   buildChildEnv,
   EXPORT_EXCLUDES,
@@ -68,24 +69,11 @@ async function realWithin(p, root) {
   return real;
 }
 
-// mkdir -p, fully confined: each component is created and reopened through the PARENT's pinned dir fd
-// (/proc/self/fd/<fd>) with O_NOFOLLOW. Every op targets a pinned inode, so a concurrently-swapped
-// path component can neither redirect the root mkdir outside the workspace nor be followed as a symlink.
+// mkdir -p, fully confined — the mkdir mode of lib.js's single confined-walk implementation.
 async function mkdirWithinConfined(targetDir, root, ownerUid = null, leafMode = null) {
-  const rel = path.relative(root, targetDir);
-  if (rel === "") return;
-  if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) throw httpErr(400, "path escapes workspace");
-  let dirFd = await fs.open(root, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+  if (path.relative(root, targetDir) === "") return;
+  const dirFd = await openConfinedDir(targetDir, root, { mkdir: true, ownerUid });
   try {
-    for (const part of rel.split(path.sep)) {
-      if (part === "" || part === "." || part === "..") throw httpErr(400, "path escapes workspace");
-      const at = `/proc/self/fd/${dirFd.fd}/${part}`;
-      try { await fs.mkdir(at); } catch (e) { if (e?.code !== "EEXIST") throw e; }
-      const childFd = await fs.open(at, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW); // O_NOFOLLOW: part must be a real dir, not a symlink
-      if (ownerUid != null) await childFd.chown(ownerUid, ownerUid); // fchown the pinned inode — never a re-walked pathname
-      await dirFd.close();
-      dirFd = childFd;
-    }
     if (leafMode != null) await dirFd.chmod(leafMode); // fchmod the leaf only (not the shared parents)
   } finally {
     await dirFd.close();
@@ -257,50 +245,94 @@ async function handleWriteFile(body) {
 async function handleEditFile(body) {
   const s = requireSession(body?.sessionId);
   const { abs, presented, root: sdir } = resolveWorkspacePath(body?.path, s.sessionId);
+  const name = path.basename(abs);
   const oldStr = body?.old_string, newStr = body?.new_string;
   if (typeof oldStr !== "string" || oldStr === "") throw httpErr(400, "old_string must be a non-empty string");
   if (typeof newStr !== "string") throw httpErr(400, "new_string must be a string");
 
-  // realWithin is inside the error mapping too: a missing or non-dir PARENT surfaces there, not at
-  // open. These are deterministic path errors — a raw 500 reads as a transient sandbox fault and
-  // invites retries.
-  let realDir, opened;
+  // Pin the file's parent dir via a confined walk from the session dir (an unswappable anchor —
+  // its parent WORKSPACE is root-owned — that also makes the fs layer enforce per-session
+  // confinement); every op below runs relative to this fd, so a component swapped after the walk
+  // can't re-route the write through a symlink — see replaceFileAtomically. What pinning fixes is
+  // the re-walk, not relocation: the uid can still move the pinned dir before the write lands, but
+  // only to places it can already write, so it gains nothing.
+  let dirFd;
   try {
-    realDir = await realWithin(path.dirname(abs), sdir);
-    opened = await openConfinedRegularFile(path.join(realDir, path.basename(abs)), sdir);
+    dirFd = await openConfinedDir(path.dirname(abs), sdir);
   } catch (e) {
+    // Deterministic path errors → 400, not a 500 the model retries. ELOOP is kept defensively
+    // though O_NOFOLLOW surfaces symlinked components as ENOTDIR first.
     if (e?.code === "ENOENT") throw httpErr(400, `${presented} does not exist — use write_file to create it`);
-    if (e?.code === "ELOOP") throw httpErr(400, `${presented} is a symlink — edit_file refuses symlinks; resolve it (run_command: readlink) and edit the target path`);
-    if (e?.code === "ENOTDIR") throw httpErr(400, `${presented} is not a valid path — a parent component is a regular file, not a directory`);
+    if (e?.code === "ENOTDIR" || e?.code === "ELOOP") throw httpErr(400, `${presented} is not editable — a parent component is a symlink or a regular file, not a directory; if it is a symlink (pnpm lays out node_modules that way), resolve it from the project root (run_command: realpath --relative-to=. -- <path>) and pass that relative path to edit_file`);
     throw e;
   }
-  const { fh, st } = opened;
-  let content;
   try {
-    if (st.size > MAX_EDIT_FILE_BYTES) {
-      throw httpErr(413, `${presented} is ${st.size} bytes, over the ${MAX_EDIT_FILE_BYTES}-byte edit limit — change it with run_command instead`);
+    let opened;
+    try {
+      opened = await openRegularFileAt(dirFd, name);
+    } catch (e) {
+      if (e?.code === "ENOENT") throw httpErr(400, `${presented} does not exist — use write_file to create it`);
+      if (e?.code === "ELOOP") throw httpErr(400, `${presented} is a symlink — edit_file refuses symlinks; resolve it from the project root (run_command: realpath --relative-to=. -- <path>) and pass that relative path to edit_file`);
+      throw e;
     }
-    const buf = await fh.readFile(); // reads to EOF; a single fh.read() may return a short count
-    content = buf.toString("utf8");
-    // A lossy decode means this isn't UTF-8 text; writing the re-encoded string back would corrupt it.
-    if (!Buffer.from(content, "utf8").equals(buf)) throw httpErr(400, `${presented} is not a UTF-8 text file`);
-  } finally { await fh.close(); }
+    const { fh, st } = opened;
+    let content;
+    try {
+      if (st.size > MAX_EDIT_FILE_BYTES) {
+        throw httpErr(413, `${presented} is ${st.size} bytes, over the ${MAX_EDIT_FILE_BYTES}-byte edit limit — change it with run_command instead`);
+      }
+      // The stat above is only a fast path — the read itself is what's bounded. A sandbox process
+      // can grow the inode between fstat and read, and an unbounded readFile would haul the whole
+      // enlarged file into memory.
+      const cap = Buffer.alloc(MAX_EDIT_FILE_BYTES + 1);
+      let got = 0;
+      while (got < cap.length) {
+        const { bytesRead } = await fh.read(cap, got, cap.length - got, got);
+        if (bytesRead === 0) break;
+        got += bytesRead;
+      }
+      if (got > MAX_EDIT_FILE_BYTES) {
+        throw httpErr(413, `${presented} is over the ${MAX_EDIT_FILE_BYTES}-byte edit limit — change it with run_command instead`);
+      }
+      const buf = cap.subarray(0, got);
+      // fatal: a lossy decode means this isn't UTF-8 text, and writing the re-encoded string back
+      // would corrupt it. ignoreBOM is load-bearing — the default strips a leading BOM, which the
+      // write-back would then silently drop from the file.
+      try {
+        content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buf);
+      } catch {
+        throw httpErr(400, `${presented} is not a UTF-8 text file`);
+      }
+    } finally { await fh.close(); }
 
-  const edit = applyEdit(content, oldStr, newStr, body?.replace_all === true, MAX_EDIT_FILE_BYTES);
-  if (edit.found === 0) {
-    throw httpErr(422, `old_string not found in ${presented} — it must match exactly, including indentation and line breaks`);
-  }
-  if (edit.ambiguous) {
-    throw httpErr(422, `old_string matches ${edit.found} places in ${presented} — include surrounding context to make it unique, or set replace_all: true`);
-  }
-  if (edit.oversize) {
-    throw httpErr(413, `that edit would grow ${presented} to ${edit.bytes} bytes, over the ${MAX_EDIT_FILE_BYTES}-byte edit limit`);
-  }
+    const edit = applyEdit(content, oldStr, newStr, body?.replace_all === true, MAX_EDIT_FILE_BYTES);
+    if (edit.illFormed) {
+      throw httpErr(400, "old_string/new_string must be well-formed text — a lone surrogate (half of an emoji or other astral character) cannot be matched or written");
+    }
+    if (edit.found === 0) {
+      throw httpErr(422, `old_string not found in ${presented} — it must match exactly, including indentation and line breaks`);
+    }
+    if (edit.ambiguous) {
+      throw httpErr(422, `old_string matches ${edit.found} places in ${presented} — include surrounding context to make it unique, or set replace_all: true`);
+    }
+    if (edit.oversize) {
+      throw httpErr(413, `that edit would grow ${presented} to ${edit.bytes} bytes, over the ${MAX_EDIT_FILE_BYTES}-byte edit limit`);
+    }
 
-  await replaceFileAtomically(realDir, path.basename(abs), edit.text, {
-    mode: st.mode & 0o777, uid: st.uid, gid: st.gid,
-  });
-  return { ok: true, path: presented, replacements: edit.found, bytes: edit.bytes };
+    // Reachable only by a concurrent swap of the leaf or the pinned dir mid-request (the confined
+    // walk already vetted both) — deterministic 400s, not 500s a model would retry blind.
+    try {
+      await replaceFileAtomically(dirFd, name, edit.text, { mode: st.mode & 0o777, uid: st.uid, gid: st.gid });
+    } catch (e) {
+      if (["ENOENT", "ENOTDIR", "EISDIR", "ELOOP"].includes(e?.code)) {
+        throw httpErr(400, `${presented} changed while the edit was in flight — re-read it and retry`);
+      }
+      throw e;
+    }
+    return { ok: true, path: presented, replacements: edit.found, bytes: edit.bytes };
+  } finally {
+    await dirFd.close();
+  }
 }
 
 async function handleReadFile(query) {

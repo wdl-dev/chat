@@ -81,7 +81,8 @@ export const TOOL_DEFINITIONS = [
     name: "deploy_test",
     description:
       "Package the current /workspace and deploy + promote it to the session ns under worker name 'app'. " +
-      "Returns { versionId, previewUrl, warnings, artifactMeta }; report any warnings to the user. previewUrl is then usable by call_preview.",
+      "Returns { versionId, previewUrl, warnings, artifactMeta }; report any warnings to the user. previewUrl is then usable by call_preview. " +
+      "Every deploy replaces the served version, so call_preview results from BEFORE it are stale: after any redeploy, re-verify every endpoint (not just the one you changed) before reporting done, using a temporary record you create for side-effecting routes.",
     input_schema: {
       type: "object",
       properties: {},

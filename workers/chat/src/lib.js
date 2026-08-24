@@ -71,9 +71,15 @@ export function capText(s, cap = TOOL_RESULT_CAP) {
   return headStr + marker + tailStr;
 }
 
-// Anthropic tool_result block.
+// Anthropic tool_result block. Top-level keys starting with "_" are stripped from the content the
+// model sees: they are the machine-only channel (step journal + DO broadcasts — e.g. deploy_test's
+// _artifactMeta, which the bench reads off preview.ready). This is the single choke point for both
+// live results and journal replays, so the model-visible shape cannot diverge between the two.
 export function toolResultBlock(toolUseId, output, isError) {
-  const content = typeof output === "string" ? output : JSON.stringify(output);
+  const visible = output != null && typeof output === "object" && !Array.isArray(output)
+    ? Object.fromEntries(Object.entries(output).filter(([k]) => !k.startsWith("_")))
+    : output;
+  const content = typeof visible === "string" ? visible : JSON.stringify(visible);
   return {
     type: "tool_result",
     tool_use_id: toolUseId,

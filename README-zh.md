@@ -56,7 +56,9 @@ MicroVM 的公网 HTTPS endpoint（带 `X-aws-proxy-auth`）跑命令 / 部署�
    echo -n <key> | wdl secret put AWS_SECRET_ACCESS_KEY --worker sandbox-broker --ns demo
    echo -n <arn> | wdl secret put MICROVM_IMAGE_ARN --worker sandbox-broker --ns demo
 3. 设 chat-worker secrets(--worker chat-worker --ns demo):
-   OPERATOR_TOKEN / LLM_API_KEY / ADMIN_URL / DEMO_PASSCODE  (TOKEN_ISSUER_TOKEN 已在步骤 1 由 bootstrap 设置)
+   LLM_API_KEY / ADMIN_URL / DEMO_PASSCODE  (TOKEN_ISSUER_TOKEN 已在步骤 1 由 bootstrap 设置)
+   # OPERATOR_TOKEN（可选）只 gate POST /admin/sessions/<id>/force-close；建议不设 ——
+   # 不设则该路由 fail-closed，卡住的会话仍可由用户 Close 或 6h 到期结束。
    # EXA_API_KEY（可选）是 web_search / web_fetch 工具的后端；不设则这两个工具返回 "not configured"。
    # LLM_API_KEY 必须匹配默认 provider(DeepSeek,Anthropic 线)。换 provider 要整组一起设:
    # LLM_API_SHAPE / LLM_BASE_URL / LLM_MODEL / LLM_MODEL_LITE(OpenAI reasoning 模型还要

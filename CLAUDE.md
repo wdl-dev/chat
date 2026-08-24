@@ -74,8 +74,12 @@ is a thin live-stack harness driven by `WDL_CHAT_BASE_URL` + `WDL_CHAT_PASSCODE`
 
 ## Tooling
 
-- `npm test` — runs `workers/*/test/*.test.js` + `sandbox-agent/test/*.test.js` (offline,
-  mocked). e2e tests are separate and need a live stack: `npm run test:e2e`.
+- `npm test` — runs `workers/*/test/*.test.js` + `sandbox-agent/test/*.test.js` +
+  `tests/bench/*.test.mjs` (offline/mocked; the browser-judge tests drive a real headless Chromium
+  against loopback servers only and hard-fail with an actionable message unless
+  `npx playwright install --with-deps chromium` has been run once — CI installs it, cached on the
+  Playwright version). The live model-selection runner `tests/bench/hard-task.mjs` is deliberately
+  not matched. e2e tests are separate and need a live stack: `npm run test:e2e`.
 - Deploy: `npm run deploy:sandbox-broker` / `deploy:chat` / `deploy:frontend` (each
   `wdl deploy . --ns demo` via the wdl-cli token store), or `bash scripts/deploy-workers.sh`
   for chat + frontend in order (regenerates `agents-md.gen.js`, then re-pins the frontend).
@@ -133,13 +137,18 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
 ## Secrets (`--ns demo`)
 
 - chat-worker: `TOKEN_ISSUER_TOKEN` (narrow token-issuer credential — mints per-session ns
-  tokens), `OPERATOR_TOKEN` (operator `/admin/*` endpoints), `LLM_API_KEY` (the LLM provider
+  tokens), `LLM_API_KEY` (the LLM provider
   key), `ADMIN_URL` (`https://api.wdl.dev`), `DEMO_PASSCODE` (portal gate), `EXA_API_KEY` (backs `web_search` / `web_fetch`; unset → both
   answer "not configured" and everything else still works); plus the optional
   `LLM_*` overrides (`LLM_API_SHAPE` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_MODEL_LITE` /
   `LLM_MAX_TOKENS` / `LLM_MAX_TOKENS_PARAM` / `LLM_BUDGET_MS` / `LLM_REASONING_EFFORT`) — these pin
   the live provider; see the LLM design decision for the current pick and its constraints
   (`LLM_MAX_TOKENS_PARAM=max_completion_tokens` is required for OpenAI reasoning models).
+  `OPERATOR_TOKEN` gates exactly one route — `POST /admin/sessions/<id>/force-close`, via the
+  `x-operator-token` header — and is **deliberately not set**: one shared secret for one escape
+  hatch is not worth carrying when a stuck session can also be ended by the user's own Close or
+  by the 6h deadline. Unset means `requireSecretEqual` rejects every caller, so the route is
+  closed rather than open. Setting it later is a secret put, no code change.
 - sandbox-broker: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (the broker's IAM user),
   `MICROVM_IMAGE_ARN` (the MicroVM image ARN — a secret so the account id isn't committed).
   Secrets are per ns+worker and write-only — renaming the worker requires re-putting them.
@@ -212,18 +221,29 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   the bytes on disk at replace time. The store itself goes through `replaceFileAtomically`: a sibling
   temp file, then `rename` (atomic), carrying mode/uid/gid over — truncating the target first would
   destroy it on a short write or ENOSPC, and `rename` swaps the inode so ownership must be restored
-  or the sandbox uid loses write access. The temp open re-verifies its fd's realpath like
-  `/write-file` does (`O_NOFOLLOW` guards only the leaf — a racing dir→symlink swap by the sandbox
-  uid would otherwise land a root-written file outside the workspace). The result size is checked by byte arithmetic *before* the
-  join, since `replace_all` can inflate a small file past the cap. The first version composed `/read-file` + `/write-file` from
+  or the sandbox uid loses write access. **Every fs op — opening the source, staging, and the rename —
+  goes through a directory fd pinned by a confined walk from the session dir** (`openConfinedDir`,
+  which is also `mkdirWithinConfined`'s implementation), never a re-walked pathname: the agent is
+  root and the sandbox uid owns the 0700 session dir under the root-owned WORKSPACE anchor, so a
+  `rename(tmp, dir/name)` by pathname lets the uid
+  swap a parent component to a symlink between the staging check and the rename and redirect the root
+  write outside the workspace (the first cut verified the staging fd's realpath and still had this
+  hole — the check guarded the *write*, not the *rename*). The precise guarantee is "no re-walk", not
+  "still in the tree at commit time": the uid can move the pinned dir before the write lands, but only
+  to places it can already write, so relocation gains it nothing. The result size is checked by byte
+  arithmetic *before* the join, since `replace_all` can inflate a small file past the cap. The first version composed `/read-file` + `/write-file` from
   chat-worker and was wrong twice over: `/read-file` caps at 256 KiB (sound for *showing* a file to
   the model, silent data loss for read-modify-write — writing that head back deleted everything past
   it), and nothing held a lock between the two calls, so an `/upload` (which writes `assets/` straight
   from the router, outside the tool batch that serial dispatch orders) could be clobbered by the stale
   snapshot. Neither is fixable in chat-worker. Consequences: **editing needs an image rebuild before
   the chat-worker deploy**, `edit_file` handles files up to `MAX_EDIT_FILE_BYTES` (8 MiB) including
-  ones `read_file` can't return in full, and it rejects a file whose bytes don't survive a UTF-8
-  round-trip rather than corrupting it. Replacement is split/join, never `String.replace`, so a
+  ones `read_file` can't return in full, it rejects non-UTF-8 files rather than corrupting them, and
+  it refuses a path whose parent chain contains a symlink (the pinned walk can't follow one safely;
+  pnpm lays out `node_modules/<pkg>` that way — the 400 tells the model to use
+  `realpath --relative-to=.` and pass the resulting project-relative path back to `edit_file`, not
+  the physical `/workspace/<session-id>/...` path that the tool would remap incorrectly). Replacement
+  is split/join, never `String.replace`, so a
   `new_string` holding `$&` / `$1` is written literally. Still not idempotent (a `new_string`
   containing `old_string` applies twice), so it stays out of `REPLAY_SAFE_TOOLS`.
   `edit_file` exists because rewriting a whole file to change a few lines burns output tokens and,
@@ -273,10 +293,18 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
 - **Supported models: DeepSeek V4, Qwen 3.7, Grok 4.5 — nothing else.** Code defaults to
   `deepseek-v4-pro` / `deepseek-v4-flash` on the Anthropic shape; the live provider is whatever the
   `LLM_*` secrets say — the secrets are the source of truth, this file only records the rationale.
-  As of 2026-08-01 that is `deepseek-v4-flash` (the GA rebuild) over its OpenAI endpoint
-  (`LLM_API_SHAPE=openai`, `LLM_BASE_URL=https://api.deepseek.com`) with **`LLM_REASONING_EFFORT=low`,
-  which is mandatory there** — unset, the model spends the whole 90s budget thinking and every open-ended
-  run dies. `grok-4.5` (xAI direct, effort=low; 4/4 on `npm run bench`) and `qwen3.7-max` (Aliyun
+  As of 2026-08-23 that is `deepseek-v4-flash-vision-exp` (both tiers) over the DeepSeek OpenAI
+  endpoint (`LLM_API_SHAPE=openai`, `LLM_BASE_URL=https://api.deepseek.com`) with
+  **`LLM_REASONING_EFFORT=low`, which is mandatory there** — unset, the model spends the whole
+  budget thinking and every open-ended run dies. vision-exp is the v4-flash base plus image input
+  at identical pricing (probe-verified: images + function tools coexist in one request; max_tokens
+  bounds reasoning like the rest of the family) — the `-exp` suffix means DeepSeek may change it
+  without notice, so on unexplained behavior shifts suspect the model tier first and fall back to
+  `deepseek-v4-flash` (a two-secret change). NOTHING in wdl-chat sends images yet: neither wire
+  shape maps an image block and the upload flow only writes files into the workspace, so vision is
+  pure latent capability until an upload→message feature (image block in `_buildLlmMessages` +
+  an `image_url` mapping in `llm-openai.js`) lands. `grok-4.5` (xAI direct, effort=low; 4/4 on the July build-only bench — `npm run bench` has since
+  grown to a five-round state machine, so re-measure before citing) and `qwen3.7-max` (Aliyun
   gateway, Anthropic shape) are the vetted alternates.
   Others were measured and dropped — Kimi K3 (~3× slower), GLM-5.2 (spends the whole budget
   thinking), Doubao Seed 2.1 (a single call ran 302s) — see the LLM-provider memory for the numbers
@@ -316,6 +344,12 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   earlier attempt to validate every way a provider could violate its spec never converged (each new
   rule interacted with the last and introduced its own holes) while never once firing against a real
   provider. Keep new checks to invariants the DO genuinely needs.
+- **`LLM_BASE_URL` is the prefix `/chat/completions` is appended to, not the provider's domain**
+  (`llm.js`: `${baseUrl}/chat/completions` on the OpenAI shape, `${baseUrl}/v1/messages` on the
+  Anthropic one). DeepSeek serves that path at the root, so its value has no `/v1` — copying that
+  shape to OpenAI (`https://api.openai.com`) is a 404 before the first token, and the key still
+  authenticates against `/v1/models`, so a credential probe does not catch it. OpenAI needs
+  `https://api.openai.com/v1`.
 - **Per-call model selection.** `pickModel` picks `LLM_MODEL` when the last message is
   intent-bearing user text, and `LLM_MODEL_LITE` for tool_result-only continuations. Code
   defaults are `deepseek-v4-pro` / `-flash`; either tier is a secret change, no code.
@@ -381,7 +415,7 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   `/contents` (boilerplate-stripped page text, `maxCharacters`-capped — far cheaper than curling raw
   HTML from the VM, which stays possible). Both are read-only (parallel batch) and **sandboxless**: a
   batch of only these must not boot or wait on a MicroVM (`SANDBOXLESS_TOOLS`). Exa reachability from
-  the ap-east-1 egress is probe-verified.
+  the platform egress is probe-verified (Tokyo, 2026-08-15).
 - **Parallel read-only tool dispatch.** Contiguous read-only tool_uses (`read_file` /
   `list_files` / `tail_logs` / `web_search` / `web_fetch`, in `READ_ONLY_TOOLS`) run in a Promise.all batch with one
   shared AbortController. Effectful tools (`write_file` / `edit_file` / `run_command` / `deploy_test` /
@@ -422,8 +456,9 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   `STRINGS` packs must stay in sync. `终止` / End (Close) permanently marks the session `closed`.
 - **DO facets are pinned to the worker version they were constructed with.** Redeploying
   chat-worker does not patch in-flight sessions — they run the old code until the host actor
-  restarts or the session closes. Mid-session fixes need operator force-close
-  (`/admin/sessions/<id>/force-close`) or user Close. The opt-out
+  restarts or the session closes. A mid-session fix reaches a live session only when the user
+  hits Close (or the 6h deadline expires) — `/admin/sessions/<id>/force-close` exists but is
+  inert unless `OPERATOR_TOKEN` is set, which it deliberately is not. The opt-out
   (`"wdl": { "session_policy": "restart" }`, which retires old facets on their next dispatch and
   closes old-version WebSockets with 1012) is deliberately **not** set here: every deploy would
   abort live users' in-flight runs, while the pinning only inconveniences development. The sandbox
@@ -456,13 +491,15 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   for the whole conversation. Every place that appends a user message must keep
   tool_use/tool_result pairing intact.
 - **A provider that works from your laptop can be geo-blocked from production.** chat-worker's
-  egress is the platform's ap-east-1 (Hong Kong) — OpenAI answers 403
-  `unsupported_country_region_territory` and the direct Gemini API 400
-  `User location is not supported` from there — and OpenRouter enforces the same block per model, so
-  routing around it does not help. DeepSeek, Qwen (Aliyun) and xAI all work. Verify a
-  candidate provider from the real egress before flipping secrets: deploy a throwaway worker in
-  the demo ns that forwards a request (key passed via request header, never stored) and delete
-  it after. Local curl success proves nothing about production.
+  egress is wherever the hosted preview runs — **since 2026-08-15 that is Tokyo (ap-northeast-1),
+  co-located with the MicroVMs; it was ap-east-1 (Hong Kong) before**. DeepSeek and Exa are
+  probe-verified from Tokyo (full e2e green). The old Hong Kong findings — OpenAI 403
+  `unsupported_country_region_territory`, direct Gemini 400 `User location is not supported`, and
+  OpenRouter enforcing the same block *per model* so routing around it did not help — were measured
+  from that egress and **have not been re-measured from Tokyo**; OpenAI/Gemini may well be reachable
+  now. Either way the rule stands: verify a candidate provider from the real egress before flipping
+  secrets — deploy a throwaway worker in the demo ns that forwards a request (key passed via request
+  header, never stored) and delete it after. Local curl success proves nothing about production.
 - **The LLM defaults to Cloudflare branding** unless told otherwise (wrangler + workerd =
   "Cloudflare Workers" in its prior). AGENTS.md has a "这不是 Cloudflare Workers" section; if
   generated output still leaks Cloudflare wording, strengthen AGENTS.md (the layer the AI

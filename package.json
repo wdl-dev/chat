@@ -2,9 +2,12 @@
   "name": "wdl-chat",
   "version": "0.0.1",
   "private": true,
-  "description": "A WDL Worker that builds WDL Workers — an AI agent running on WDL that generates, previews, and deploys WDL Worker code",
+  "description": "A WDL Worker that builds WDL Workers \u2014 an AI agent running on WDL that generates, previews, and deploys WDL Worker code",
   "license": "Apache-2.0",
-  "repository": { "type": "git", "url": "git+https://github.com/wdl-dev/chat.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wdl-dev/chat.git"
+  },
   "homepage": "https://chat.wdl.dev",
   "type": "module",
   "workspaces": [
@@ -14,7 +17,7 @@
     "workers/frontend"
   ],
   "scripts": {
-    "test": "node --test workers/*/test/*.test.js sandbox-agent/test/*.test.js",
+    "test": "node --test workers/*/test/*.test.js sandbox-agent/test/*.test.js tests/bench/*.test.mjs",
     "check": "git ls-files '*.js' '*.mjs' | xargs -n1 node --check",
     "test:e2e": "node --test tests/e2e/*.test.js",
     "bench": "node tests/bench/hard-task.mjs",
@@ -24,7 +27,8 @@
     "bootstrap": "node scripts/bootstrap.js"
   },
   "devDependencies": {
-    "@wdl-dev/cli": "1.7.1"
+    "@wdl-dev/cli": "1.7.1",
+    "playwright": "1.56.1"
   },
   "engines": {
     "node": ">=24"

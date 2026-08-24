@@ -45,7 +45,7 @@
   // secrets via `wdl secret put --worker chat-worker --ns demo`:
   //   TOKEN_ISSUER_TOKEN     - narrow token-issuer credential; mints per-session
   //                            tmp ns tokens via /auth/delegated-tokens
-  //   OPERATOR_TOKEN         - operator endpoints (/admin/*)
+  //   OPERATOR_TOKEN         - optional; POST /admin/sessions/<id>/force-close only (unset fails closed)
   //   LLM_API_KEY            - LLM provider key
   //   LLM_API_SHAPE          - optional; "openai" switches the wire format (default anthropic)
   //   ADMIN_URL              - https://api.wdl.dev

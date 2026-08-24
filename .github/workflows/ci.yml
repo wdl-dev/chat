@@ -27,7 +27,18 @@ jobs:
           cache-dependency-path: package-lock.json
 
       - run: npm ci
-      # The unit suite runs fully offline (mocked dependencies); the e2e suite
-      # (npm run test:e2e) drives the live deployment and is not run in CI.
+
+      # The browser-judge tests need a real Chromium (loopback-only traffic; still no external
+      # network). Cache the browser download keyed on the pinned Playwright version.
+      - id: playwright-version
+        run: echo "version=$(node -p "require('playwright/package.json').version")" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}
+      - run: npx playwright install --with-deps chromium
+
+      # The unit suite runs offline (mocked dependencies; browser tests hit loopback only); the
+      # e2e suite (npm run test:e2e) drives the live deployment and is not run in CI.
       - run: npm run check
       - run: npm test

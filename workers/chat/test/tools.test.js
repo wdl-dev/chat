@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { dispatchTool, uploadAsset, __test__ } from "../src/tools.js";
 
-const { parseSseBlock, clampInt, runsWdlInitCommand } = __test__;
+const { parseSseBlock, clampInt, runsWdlInitCommand, summarizeArtifact } = __test__;
 
 function makeCtx(overrides = {}) {
   let preview = null;
@@ -778,11 +778,50 @@ test("deploy_test packs on the MicroVM then deploys + promotes via control", asy
   assert.equal(out.versionId, "v3");
   assert.equal(out.previewUrl, "https://tmp-1234.wdl.sh/app/");
   assert.equal(ctx.previewUrl(), "https://tmp-1234.wdl.sh/app/");
+  assert.match(out._artifactMeta.artifactDigest, /^[0-9a-f]{64}$/);
+  assert.deepEqual(out._artifactMeta.assetPaths, []);
+  assert.deepEqual(out.artifactMeta.modulePaths, ["index.js"]);
+  // The digest is bench-only noise to the model: it must ride the "_" channel, not the visible meta.
+  assert.equal(out.artifactMeta.artifactDigest, undefined);
+  assert.equal(out.artifactMeta.assetPaths, undefined);
   // /package on the MicroVM, then control deploy + promote carrying the ns token.
   assert.match(calls[0].url, /\/package$/);
   assert.match(calls[1].url, /\/ns\/tmp-1234\/worker\/app\/deploy$/);
   assert.equal(calls[1].init.headers["x-admin-token"], "ns-tok");
   assert.match(calls[2].url, /\/ns\/tmp-1234\/worker\/app\/promote$/);
+
+  // A first deploy carries no re-verification nag; a REdeploy must — that is the moment models
+  // skip full re-verification, and the reminder lands together with the now-stale results.
+  assert.equal(out.reverify, undefined);
+  const again = await dispatchTool({ name: "deploy_test", input: {}, ctx, signal: undefined, fetcher });
+  assert.match(again.reverify, /stale.*Re-verify ALL endpoints/s);
+});
+
+test("artifact metadata is order-stable and changes with deployable bytes", async () => {
+  const artifact = {
+    mainModule: "index.js",
+    modules: { "index.js": "worker-v1", "chunk.js": "chunk-v1" },
+    bindings: { TODOS: { type: "kv", id: "todos" } },
+    assets: { "styles/main.css": "Y3NzLXYx", "app.js": "anMtdjE=" },
+  };
+  const reordered = {
+    assets: { "app.js": "anMtdjE=", "styles/main.css": "Y3NzLXYx" },
+    bindings: { TODOS: { id: "todos", type: "kv" } },
+    modules: { "chunk.js": "chunk-v1", "index.js": "worker-v1" },
+    mainModule: "index.js",
+  };
+
+  const first = await summarizeArtifact(artifact);
+  const same = await summarizeArtifact(reordered);
+  const changedCode = await summarizeArtifact({ ...artifact, modules: { ...artifact.modules, "index.js": "worker-v2" } });
+  const changedAsset = await summarizeArtifact({ ...artifact, assets: { ...artifact.assets, "app.js": "anMtdjI=" } });
+
+  assert.equal(first.artifactDigest, same.artifactDigest);
+  assert.notEqual(first.artifactDigest, changedCode.artifactDigest);
+  assert.notEqual(first.artifactDigest, changedAsset.artifactDigest);
+  assert.deepEqual(first.modulePaths, ["chunk.js", "index.js"]);
+  assert.deepEqual(first.assetPaths, ["app.js", "styles/main.css"]);
+  assert.equal(first.assetCount, 2);
 });
 
 test("deploy_test warns when a requested restart policy is not confirmed on promote", async () => {

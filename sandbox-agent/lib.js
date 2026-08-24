@@ -223,15 +223,54 @@ export const EXPORT_EXCLUDES = [
   ".env", ".env.*", ".dev.vars", ".dev.vars.*",
 ];
 
-// Open target for reading as the /edit-file source: leaf symlinks refused (this feeds a write-back,
-// unlike /read-file which deliberately follows them), O_NONBLOCK so a writer-less FIFO can't wedge
-// the open — it runs holding the session write lock, so a wedge outlives the caller's timeout and
-// jams every later file op — and the fd's realpath confined to root before anything is read.
-export async function openConfinedRegularFile(target, root) {
-  const fh = await fs.open(target, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_NONBLOCK);
+// Walk root → dir, opening each component O_NOFOLLOW through the parent's pinned fd, and return the
+// leaf directory's FileHandle. Every lookup targets a pinned inode, so a path component the sandbox
+// uid swaps concurrently can't redirect an operation the caller then runs relative to the returned
+// fd. The caller closes it. root must be an anchor the sandbox uid can't swap — WORKSPACE and the
+// session dir both qualify, their parents being root-owned. A symlinked or regular-file component
+// fails ENOTDIR (O_DIRECTORY + O_NOFOLLOW rejects both as "not a directory" before ELOOP fires).
+//
+// With mkdir: true each missing component is created first (and chowned to ownerUid when set),
+// still through the parent's pinned fd — the mkdir -p counterpart. Deliberately the ONLY
+// implementation of this walk: a hardening applied to a forked copy misses the other.
+export async function openConfinedDir(dir, root, { mkdir = false, ownerUid = null } = {}) {
+  const rel = path.relative(root, dir);
+  if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) throw httpErr(400, "path escapes workspace");
+  let dirFd = await fs.open(root, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+  if (rel === "") return dirFd;
   try {
-    const real = await fs.realpath(`/proc/self/fd/${fh.fd}`);
-    if (real !== root && !real.startsWith(root + path.sep)) throw httpErr(400, "path escapes workspace");
+    for (const part of rel.split(path.sep)) {
+      if (part === "" || part === "." || part === "..") throw httpErr(400, "path escapes workspace");
+      const at = `/proc/self/fd/${dirFd.fd}/${part}`;
+      if (mkdir) {
+        try { await fs.mkdir(at); } catch (e) { if (e?.code !== "EEXIST") throw e; }
+      }
+      const child = await fs.open(at, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+      // Until child becomes dirFd the outer catch can't see it, so a failing chown (EROFS, id-map
+      // errors) must close it here; the parent's own close failure is inert and must not leak it either.
+      try {
+        if (mkdir && ownerUid != null) await child.chown(ownerUid, ownerUid); // fchown the pinned inode — never a re-walked pathname
+      } catch (err) {
+        await child.close().catch(() => {});
+        throw err;
+      }
+      await dirFd.close().catch(() => {});
+      dirFd = child;
+    }
+    return dirFd;
+  } catch (err) {
+    await dirFd.close().catch(() => {});
+    throw err;
+  }
+}
+
+// Open `name` for reading inside the pinned dir fd, as the /edit-file source. Confinement is the dir
+// fd itself — the lookup can't leave the pinned inode. O_NOFOLLOW refuses a leaf symlink (ELOOP; the
+// edit feeds a write-back, so unlike /read-file it must not follow), O_NONBLOCK stops a writer-less
+// FIFO wedging the open while the session write lock is held, and a regular-file check rejects the rest.
+export async function openRegularFileAt(dirFd, name) {
+  const fh = await fs.open(`/proc/self/fd/${dirFd.fd}/${name}`, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_NONBLOCK);
+  try {
     const st = await fh.stat();
     if (!st.isFile()) throw httpErr(400, "not a regular file");
     return { fh, st };
@@ -244,7 +283,12 @@ export async function openConfinedRegularFile(target, root) {
 // The textual half of /edit-file, split out so it is testable without a session or a real fd.
 // split/join rather than String.replace: a newStr containing $& or $1 would otherwise be read as a
 // replacement pattern. With found === 1 the join is exactly the single-replacement case.
+// Ill-formed needles are refused up front: a lone-surrogate oldStr can match half an emoji, and
+// the byte arithmetic below is only exact when every split part is well-formed (a lone surrogate
+// encodes as 3 bytes where the intact pair had 4). content itself is always well-formed — it
+// arrives via a fatal UTF-8 decode.
 export function applyEdit(content, oldStr, newStr, replaceAll, maxBytes = Infinity) {
+  if (!oldStr.isWellFormed() || !newStr.isWellFormed()) return { illFormed: true };
   const parts = content.split(oldStr);
   const found = parts.length - 1;
   if (found === 0) return { found: 0 };
@@ -258,36 +302,30 @@ export function applyEdit(content, oldStr, newStr, replaceAll, maxBytes = Infini
   return { found, bytes, text: parts.join(newStr) };
 }
 
-// Replace dir/name's contents by staging a sibling temp file and renaming over the target. rename is
-// atomic, so a failure anywhere before it leaves the existing file exactly as it was — truncating the
-// target first would destroy it on a short write or ENOSPC. writeFile/rename also handle partial
-// writes, which a lone fh.write() does not. Mode and ownership carry over so the sandbox uid keeps
-// its access to the new inode.
-export async function replaceFileAtomically(dir, name, text, { mode, uid, gid }) {
-  // The staging name must not embed `name`: a basename can be up to 255 bytes, and appending a UUID
-  // would push a legitimately-named file past NAME_MAX (ENAMETOOLONG). The UUID alone is unique.
-  const tmp = path.join(dir, `.edit-${randomUUID()}.tmp`);
+// Atomically replace `name` inside the pinned dir fd. Stage a sibling temp, then rename over the
+// target: rename is atomic, so a failure before it leaves the existing file exactly as it was
+// (truncate-then-write would destroy it on a short write or ENOSPC). Both the staging create and the
+// rename resolve through /proc/self/fd/<dirFd> — the pinned directory inode — so a parent component
+// the sandbox uid swaps to a symlink mid-request cannot redirect this root write outside the
+// workspace; a raw pathname rename re-walks that mutable parent and can. writeFile handles a short
+// write a lone fh.write() would not; chmod re-sets the mode open() masked by umask; uid/gid carry
+// over since rename swaps the inode. Staging name omits `name` so a 255-byte basename + uuid can't
+// hit ENAMETOOLONG; the uuid alone is unique.
+export async function replaceFileAtomically(dirFd, name, text, { mode, uid, gid }) {
+  const base = `/proc/self/fd/${dirFd.fd}`;
+  const tmp = `${base}/.edit-${randomUUID()}.tmp`;
   let fh = null;
-  let real = tmp;
   try {
     fh = await fs.open(tmp, FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL | FS.O_NOFOLLOW, mode);
-    // O_NOFOLLOW guards only the leaf. A dir component swapped to a symlink after the caller's
-    // realpath is still followed, landing the temp outside `dir` — verify where the fd actually
-    // landed, same as /write-file. A swap AFTER this check makes the rename below re-resolve tmp
-    // through the symlink and fail ENOENT, so nothing escapes on that side either.
-    real = await fs.realpath(`/proc/self/fd/${fh.fd}`);
-    if (path.dirname(real) !== dir) throw httpErr(400, "path escapes workspace");
     await fh.writeFile(text);
     await fh.chown(uid, gid);
-    // open()'s mode argument is masked by umask, so a 0666 original would come back 0644 — fchmod
-    // the verified fd to restore the mode exactly.
     await fh.chmod(mode);
     await fh.close();
     fh = null;
-    await fs.rename(tmp, path.join(dir, name));
+    await fs.rename(tmp, `${base}/${name}`);
   } catch (err) {
     if (fh) await fh.close().catch(() => {});
-    await fs.unlink(real).catch(() => {});
+    await fs.unlink(tmp).catch(() => {});
     throw err;
   }
 }

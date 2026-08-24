@@ -620,7 +620,7 @@ export class ChatSessionDO extends DurableObject {
         this._broadcast("preview.ready", {
           versionId: result.output.versionId,
           previewUrl: result.output.previewUrl,
-          artifactMeta: result.output.artifactMeta ?? null,
+          artifactMeta: result.output._artifactMeta ?? result.output.artifactMeta ?? null,
         });
       }
       if (result.status === "aborted") { abortedMidway = true; break; }
@@ -1204,10 +1204,16 @@ export class ChatSessionDO extends DurableObject {
       if (runStopReason != null) payload.stop_reason = runStopReason;
       emit(`run.${runStatus}`, payload);
     }
+    // `input` also contains arbitrary model-authored tool arguments. A LIKE search for the word
+    // deploy_test lets a later write_file/run_command mentioning it shadow the real deploy, so a
+    // reconnect loses preview.ready. DO SQLite includes the JSON extension: match the journal
+    // envelope's top-level tool name in SQL and avoid materializing every prior tool input in JS.
     const lastDeploy = firstRow(this.sql.exec(
       `SELECT output FROM steps
-         WHERE status = 'done' AND kind = 'tool_call' AND input LIKE '%"deploy_test"%'
-      ORDER BY started_at DESC LIMIT 1`,
+         WHERE status = 'done' AND kind = 'tool_call'
+           AND json_extract(input, '$.name') = ?
+      ORDER BY started_at DESC, rowid DESC LIMIT 1`,
+      "deploy_test",
     ));
     if (lastDeploy?.output) {
       try {
@@ -1216,7 +1222,7 @@ export class ChatSessionDO extends DurableObject {
           emit("preview.ready", {
             versionId: out.versionId,
             previewUrl: out.previewUrl,
-            artifactMeta: out.artifactMeta ?? null,
+            artifactMeta: out._artifactMeta ?? out.artifactMeta ?? null,
             replay: true,
           });
         }

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, readdirSync, statSync, chmodSync, symlinkSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, readdirSync, statSync, chmodSync, symlinkSync, realpathSync, renameSync, existsSync, promises as fsp, constants as FSC } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,7 +10,8 @@ import {
   WORKSPACE,
   appendCapped,
   applyEdit,
-  openConfinedRegularFile,
+  openConfinedDir,
+  openRegularFileAt,
   replaceFileAtomically,
   buildChildEnv,
   exportFilename,
@@ -388,31 +389,45 @@ test("applyEdit sizes the result in UTF-8 bytes, including multi-byte replacemen
   assert.equal(applyEdit("a-a", "a", "值", true, 6).oversize, true);
 });
 
-test("replaceFileAtomically swaps contents in place, preserving mode", async () => {
+test("applyEdit refuses lone-surrogate needles, whose splits break the byte arithmetic", () => {
+  // "\ud83d" matches half of 😀; the split parts then hold lone surrogates, which encode as 3-byte
+  // U+FFFD where the intact pair was 4 — so the byte arithmetic under-reports and the guard is
+  // what keeps `bytes` trustworthy against maxBytes.
+  assert.equal(applyEdit("😀😀", "\ud83d", "X", true).illFormed, true);
+  assert.equal(applyEdit("a", "a", "\ude00", false).illFormed, true);
+  // Whole astral characters are well-formed and stay editable, and the math stays exact.
+  const r = applyEdit("a😀b", "😀", "值", false);
+  assert.equal(r.text, "a值b");
+  assert.equal(r.bytes, Buffer.byteLength("a值b"));
+});
+
+// replaceFileAtomically / openRegularFileAt operate relative to a pinned directory fd — that pin is
+// the confinement, so the tests open one over a temp dir and pass it in.
+const withDirFd = async (dir, fn) => {
+  const fd = await fsp.open(dir, FSC.O_RDONLY | FSC.O_DIRECTORY);
+  try { return await fn(fd); } finally { await fd.close(); }
+};
+
+test("replaceFileAtomically swaps contents in place, preserving mode and leaving no temp", async () => {
   const dir = mkdtempSync(join(tmpdir(), "atomic-"));
   try {
-    const target = join(dir, "f.txt");
-    writeFileSync(target, "old", { mode: 0o640 });
-    const before = statSync(target);
-    await replaceFileAtomically(dir, "f.txt", "new contents", {
-      mode: before.mode & 0o777, uid: before.uid, gid: before.gid,
-    });
-    assert.equal(readFileSync(target, "utf8"), "new contents");
-    assert.equal(statSync(target).mode & 0o777, 0o640);
-    // The staging file must not survive a success.
-    assert.deepEqual(readdirSync(dir), ["f.txt"]);
+    writeFileSync(join(dir, "f.txt"), "old", { mode: 0o640 });
+    const before = statSync(join(dir, "f.txt"));
+    await withDirFd(dir, (fd) => replaceFileAtomically(fd, "f.txt", "new contents", { mode: before.mode & 0o777, uid: before.uid, gid: before.gid }));
+    assert.equal(readFileSync(join(dir, "f.txt"), "utf8"), "new contents");
+    assert.equal(statSync(join(dir, "f.txt")).mode & 0o777, 0o640);
+    assert.deepEqual(readdirSync(dir), ["f.txt"], "staging file must not survive a success");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("replaceFileAtomically leaves the original intact when the write path fails", async () => {
   const dir = mkdtempSync(join(tmpdir(), "atomic-"));
   try {
-    const target = join(dir, "f.txt");
-    writeFileSync(target, "original");
+    writeFileSync(join(dir, "f.txt"), "original");
     // chown to root fails for a non-root test process — stands in for any mid-write failure
     // (ENOSPC, I/O error). Truncate-then-write would already have destroyed the file by here.
-    await assert.rejects(() => replaceFileAtomically(dir, "f.txt", "replacement", { mode: 0o644, uid: 0, gid: 0 }));
-    assert.equal(readFileSync(target, "utf8"), "original");
+    await withDirFd(dir, (fd) => assert.rejects(() => replaceFileAtomically(fd, "f.txt", "replacement", { mode: 0o644, uid: 0, gid: 0 })));
+    assert.equal(readFileSync(join(dir, "f.txt"), "utf8"), "original");
     assert.deepEqual(readdirSync(dir), ["f.txt"], "temp file must be cleaned up on failure");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -421,13 +436,12 @@ test("replaceFileAtomically restores a mode umask would have masked off", async 
   const dir = mkdtempSync(join(tmpdir(), "atomic-"));
   try {
     for (const mode of [0o666, 0o664]) {
-      const target = join(dir, "f.txt");
-      writeFileSync(target, "old");
-      chmodSync(target, mode);
-      const before = statSync(target);
+      writeFileSync(join(dir, "f.txt"), "old");
+      chmodSync(join(dir, "f.txt"), mode);
+      const before = statSync(join(dir, "f.txt"));
       assert.equal(before.mode & 0o777, mode, "precondition: chmod is not itself masked");
-      await replaceFileAtomically(dir, "f.txt", "new", { mode, uid: before.uid, gid: before.gid });
-      assert.equal(statSync(target).mode & 0o777, mode, `mode ${mode.toString(8)} must survive the swap`);
+      await withDirFd(dir, (fd) => replaceFileAtomically(fd, "f.txt", "new", { mode, uid: before.uid, gid: before.gid }));
+      assert.equal(statSync(join(dir, "f.txt")).mode & 0o777, mode, `mode ${mode.toString(8)} must survive the swap`);
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -439,50 +453,89 @@ test("replaceFileAtomically handles a basename at the filesystem limit", async (
     const name = "a".repeat(230) + ".txt";
     writeFileSync(join(dir, name), "old");
     const before = statSync(join(dir, name));
-    await replaceFileAtomically(dir, name, "new", { mode: before.mode & 0o777, uid: before.uid, gid: before.gid });
+    await withDirFd(dir, (fd) => replaceFileAtomically(fd, name, "new", { mode: before.mode & 0o777, uid: before.uid, gid: before.gid }));
     assert.equal(readFileSync(join(dir, name), "utf8"), "new");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("replaceFileAtomically rejects a dir reached through a symlink and leaves no temp behind", async () => {
-  const base = mkdtempSync(join(tmpdir(), "atomic-"));
+test("replaceFileAtomically follows the pinned dir fd, not a swapped parent pathname", async () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "atomic-")));
   try {
-    // Models the TOCTOU swap: the verified dir path now resolves elsewhere.
-    mkdirSync(join(base, "realdir"));
-    writeFileSync(join(base, "realdir", "f.txt"), "original");
-    symlinkSync(join(base, "realdir"), join(base, "swapped"));
-    await assert.rejects(
-      () => replaceFileAtomically(join(base, "swapped"), "f.txt", "evil", { mode: 0o644, uid: process.getuid(), gid: process.getgid() }),
-      /escapes workspace/,
-    );
-    assert.equal(readFileSync(join(base, "realdir", "f.txt"), "utf8"), "original");
-    assert.deepEqual(readdirSync(join(base, "realdir")), ["f.txt"], "temp must be cleaned from the REAL dir");
+    // The TOCTOU the pin exists for: once the dir fd is pinned, the sandbox uid swaps the dir's
+    // pathname to a symlink pointing outside. A raw pathname rename would land the root write in
+    // `evil`; through the pinned fd it reaches the real inode (now at `moved`) instead.
+    mkdirSync(join(base, "real"));
+    writeFileSync(join(base, "real", "f.txt"), "old");
+    mkdirSync(join(base, "evil"));
+    const before = statSync(join(base, "real", "f.txt"));
+    await withDirFd(join(base, "real"), async (fd) => {
+      renameSync(join(base, "real"), join(base, "moved"));
+      symlinkSync(join(base, "evil"), join(base, "real"));
+      await replaceFileAtomically(fd, "f.txt", "new", { mode: before.mode & 0o777, uid: before.uid, gid: before.gid });
+    });
+    assert.equal(readFileSync(join(base, "moved", "f.txt"), "utf8"), "new", "write must follow the fd to the real inode");
+    assert.equal(existsSync(join(base, "evil", "f.txt")), false, "the swapped-in target must be untouched");
   } finally { rmSync(base, { recursive: true, force: true }); }
+});
+
+test("openConfinedDir pins a nested dir and rejects symlink / non-dir / traversal components", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "confine-")));
+  try {
+    mkdirSync(join(root, "a", "b"), { recursive: true });
+    writeFileSync(join(root, "a", "b", "f.txt"), "hi");
+    const fd = await openConfinedDir(join(root, "a", "b"), root);
+    try {
+      const { fh } = await openRegularFileAt(fd, "f.txt");
+      try { assert.equal((await fh.readFile()).toString(), "hi"); } finally { await fh.close(); }
+    } finally { await fd.close(); }
+    // A symlinked or regular-file component both refuse to be descended (O_DIRECTORY + O_NOFOLLOW
+    // makes a symlink ENOTDIR, not ELOOP) — the handler maps both to one actionable 400.
+    symlinkSync(join(root, "a"), join(root, "lnk"));
+    await assert.rejects(() => openConfinedDir(join(root, "lnk", "b"), root), (e) => e.code === "ENOTDIR" || e.code === "ELOOP");
+    await assert.rejects(() => openConfinedDir(join(root, "a", "b", "f.txt"), root), (e) => e.code === "ENOTDIR");
+    await assert.rejects(() => openConfinedDir(join(root, ".."), root), /escapes workspace/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// Runs unprivileged, so chown-to-root fails EPERM — the same shape as the EROFS/id-map failures
+// reachable in production. The child fd is open but not yet assigned to the loop variable when
+// chown throws, so only an inner cleanup can reach it; the leak shows up as a grown fd table.
+test("openConfinedDir does not leak the child fd when chown fails mid-walk", async (t) => {
+  if (typeof process.getuid === "function" && process.getuid() === 0) return t.skip("needs an unprivileged uid");
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "confine-")));
+  try {
+    const before = readdirSync("/proc/self/fd").length;
+    for (let i = 0; i < 10; i++) {
+      await assert.rejects(
+        () => openConfinedDir(join(root, `n${i}`, "sub"), root, { mkdir: true, ownerUid: 0 }),
+        (e) => e.code === "EPERM");
+    }
+    assert.equal(readdirSync("/proc/self/fd").length, before, "fd table must not grow across failed walks");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 // timeout: the regression this guards is a HANG (blocking open on a writer-less FIFO while holding
 // the session write lock), which without the cap would wedge the whole test run, not fail it.
-test("openConfinedRegularFile refuses a writer-less FIFO instead of blocking on it", { timeout: 5000 }, async () => {
+test("openRegularFileAt refuses a writer-less FIFO instead of blocking on it", { timeout: 5000 }, async () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "confine-")));
   try {
     execFileSync("mkfifo", [join(dir, "pipe")]);
-    await assert.rejects(() => openConfinedRegularFile(join(dir, "pipe"), dir), /not a regular file/);
+    await withDirFd(dir, (fd) => assert.rejects(() => openRegularFileAt(fd, "pipe"), /not a regular file/));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("openConfinedRegularFile returns fh+st for a regular file and refuses a leaf symlink", async () => {
+test("openRegularFileAt returns fh+st for a regular file and refuses a leaf symlink", async () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "confine-")));
   try {
     writeFileSync(join(dir, "f.txt"), "hi");
-    const { fh, st } = await openConfinedRegularFile(join(dir, "f.txt"), dir);
-    try {
-      assert.equal(st.size, 2);
-      assert.equal((await fh.readFile()).toString(), "hi");
-    } finally { await fh.close(); }
-    // Unlike /read-file, the edit source must not be reached through a leaf symlink (ELOOP).
     symlinkSync(join(dir, "f.txt"), join(dir, "ln"));
-    await assert.rejects(() => openConfinedRegularFile(join(dir, "ln"), dir), (e) => e.code === "ELOOP");
-    // A path THROUGH a regular file — the codes the handler maps to actionable 400s must survive.
-    await assert.rejects(() => openConfinedRegularFile(join(dir, "f.txt", "sub.js"), dir), (e) => e.code === "ENOTDIR");
+    await withDirFd(dir, async (fd) => {
+      const { fh, st } = await openRegularFileAt(fd, "f.txt");
+      try {
+        assert.equal(st.size, 2);
+        assert.equal((await fh.readFile()).toString(), "hi");
+      } finally { await fh.close(); }
+      await assert.rejects(() => openRegularFileAt(fd, "ln"), (e) => e.code === "ELOOP");
+    });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

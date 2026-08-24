@@ -58,6 +58,8 @@ But **the URL the browser sees does carry /app**. For links in HTML:
 
 **Mandatory self-check**: the `call_preview` tool prepends the `/app/` prefix for you, so **a tool test always passes**; only requests sent by the user's browser hit the trap. After deploying, always `call_preview {path: "/"}` to pull the HTML + pull every CDN JS referenced by `<script src>`, and grep `\b/api/` to spot any absolute path missing the `/app` prefix.
 
+**Re-verify everything after every redeploy**: after fixing a bug and running `deploy_test` again, re-run `call_preview` against **all** endpoints — not just the one you changed. Tests that ran against the previous version don't count: one fix can break another route, and the version the user gets is the last one deployed. **When verifying endpoints with side effects (create/toggle/delete), create a dedicated temporary test record and operate only on it — never use existing rows as test subjects**: they may be the user's data, and toggling flips it or deleting destroys it for real.
+
 ### 4. The project root is the shell cwd — **don't cd**, **don't touch the `/workspace` absolute path**
 
 When your shell opens you're already in the project root. `pwd` may show `/workspace/<token>/` — that's the real path of your project root, **which is normal**. When the docs (this one + tool responses) say `/workspace`, they mean your project root, not the literal root directory `/workspace`.

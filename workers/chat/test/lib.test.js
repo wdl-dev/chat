@@ -24,6 +24,13 @@ test("toolResultBlock stringifies non-string output + coerces is_error", () => {
   });
 });
 
+test("toolResultBlock strips top-level _ keys from the model-visible content", () => {
+  const out = toolResultBlock("tu3", { versionId: "v1", _artifactMeta: { artifactDigest: "d" } }, false);
+  assert.equal(out.content, '{"versionId":"v1"}');
+  // Only the top level is a channel; a nested underscore key is ordinary data.
+  assert.equal(toolResultBlock("tu4", { a: { _b: 1 } }, false).content, '{"a":{"_b":1}}');
+});
+
 test("extractText joins text blocks, ignores others, trims", () => {
   assert.equal(extractText([{ type: "text", text: "a" }, { type: "tool_use", name: "x" }, { type: "text", text: "b" }]), "a\nb");
   assert.equal(extractText([{ type: "tool_result", content: "z" }]), "");
