@@ -55,6 +55,8 @@ const STRINGS = {
     "status.exported": "Export downloaded",
     "status.uploading": "Uploading…",
     "status.uploaded": (n) => `Uploaded ${n} file${n === 1 ? "" : "s"} to ./assets`,
+    "attach.vision": "Will be shown to the model with your next message",
+    "attach.partial": (n) => `${n} image${n === 1 ? "" : "s"} weren't sent (no longer available)`,
     "err.exportFailed": (s) => `Export failed: ${s}`,
     "err.uploadFailed": (s) => `Upload failed: ${s}`,
     "preview.title": "Preview",
@@ -125,6 +127,8 @@ const STRINGS = {
     "status.exported": "已下载导出包",
     "status.uploading": "上传中…",
     "status.uploaded": (n) => `已上传 ${n} 个文件到 ./assets`,
+    "attach.vision": "将随下一条消息展示给模型",
+    "attach.partial": (n) => `有 ${n} 张图片未随消息发送（已失效）`,
     "err.exportFailed": (s) => `导出失败：${s}`,
     "err.uploadFailed": (s) => `上传失败：${s}`,
     "preview.title": "预览",
@@ -326,12 +330,14 @@ function shouldRender(seq) {
 function renderUser(seq, content, createdAt) {
   if (!shouldRender(seq)) return;
   let text = "";
+  let images = [];
   if (Array.isArray(content)) {
     text = content.filter(b => b?.type === "text").map(b => b.text).join("\n");
+    images = content.filter(b => b?.type === "image_ref");
   } else if (typeof content === "string") {
     text = content;
   }
-  if (!text) return;
+  if (!text && images.length === 0) return;
   closeAgentGroup();
   const div = document.createElement("div");
   div.className = "msg msg-user";
@@ -339,6 +345,17 @@ function renderUser(seq, content, createdAt) {
   body.className = "msg-body";
   body.textContent = text;
   div.appendChild(body);
+  if (images.length > 0) {
+    const wrap = document.createElement("div");
+    wrap.className = "msg-attachments";
+    for (const b of images) {
+      const chip = document.createElement("span");
+      chip.className = "upload-chip vision";
+      chip.textContent = `🖼 ${typeof b.name === "string" ? b.name : "image"}`;  // security: never innerHTML
+      wrap.appendChild(chip);
+    }
+    div.appendChild(wrap);
+  }
   appendTime(div, createdAt);
   messagesEl.appendChild(div);
   scrollMsgs();
@@ -825,7 +842,8 @@ function fmtCountdown(ms) {
   return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
 }
 
-// Hitting 0 ends the session client-side; the server only enforces lazily on the next request.
+// Hitting 0 ends the session client-side; the server tears down via its expiry alarm just past the
+// gate and lazily on the next request, whichever comes first.
 function startCountdown(expiresAt) {
   if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
   const deadline = Number(expiresAt);
@@ -959,6 +977,11 @@ function handleEvent(type, data) {
   switch (type) {
     case "message.user":
       if (!data?.replay) clearStoppingNote();
+      // Outcome reconciliation: the stream is authoritative for which attachments actually rode a
+      // message (live or replayed after a network-unknown send) — settle them.
+      if (Array.isArray(data?.content)) {
+        for (const b of data.content) if (b?.type === "image_ref") retireAttachmentId(b.id);
+      }
       renderUser(data?.seq, data?.content, data?.createdAt);
       break;
     case "message.assistant":
@@ -1049,21 +1072,43 @@ async function send() {
   if (!text || !sessionId) return;
   const original = inputEl.value;
   inputEl.value = "";
-  clearUploadChips();
   const mode = planModeEnabled ? "plan_confirmed" : "free_form";
+  // Reserve the attachment snapshot atomically: a second send fired before this one settles must
+  // not carry (and race for) the same ids. Restored on failure.
+  const reserved = pendingAttachments;
+  pendingAttachments = [];
+  const atts = reserved.map(a => a.id);
+  // Freeze each chip's id at send start; a concurrent failed send may mutate the node's dataset
+  // (downgrade attachmentId -> dead-id) before this send settles, so the removal decision must not
+  // re-read it later.
+  const chipSnapshot = [...uploadChips.children].map(node => ({
+    node,
+    aid: node.dataset.attachmentId ? Number(node.dataset.attachmentId) : NaN,
+  }));
   try {
     const res = await fetch(`${apiBase()}/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ content: text, mode }),
+      body: JSON.stringify(atts.length ? { content: text, mode, attachments: atts } : { content: text, mode }),
     });
     if (!res.ok) {
       if (inputEl.value === "") inputEl.value = original;
       if (res.status === 410) { endSessionUi("status.expired"); return; }
+      // A gateway/binding 5xx or 408 can arrive after the DO committed — outcome unknown, abandon.
+      if (RESTORE_STATUSES.has(res.status)) restoreReserved(reserved);
+      else abandonReserved(reserved);
       setStatus(tr("err.sendFailed", res.status));
+      return;
     }
+    // A 202 proves admission, not which ids rode it; only the echoed set is authoritative, and an
+    // unreadable body means unknown (null), not "all consumed".
+    const accepted = await res.json().catch(() => null);
+    const consumed = Array.isArray(accepted?.attachments) ? accepted.attachments : null;
+    const missed = removeSentChips(atts, consumed, chipSnapshot);
+    if (missed) setStatus(tr("attach.partial", missed));
   } catch {
     if (inputEl.value === "") inputEl.value = original;
+    abandonReserved(reserved);
     setStatus(tr("err.sendFailed", "network"));
   }
 }
@@ -1100,19 +1145,97 @@ async function exportCode() {
   }
 }
 
-function addUploadChip(name) {
+const MAX_PENDING_ATTACHMENTS = 4; // mirrors the server's pending pool / per-message cap
+// The router's own validation rejections — the only statuses that PROVE nothing persisted.
+const RESTORE_STATUSES = new Set([400, 404, 409, 413]);
+let pendingAttachments = [];
+// Session-lifetime tombstones: ids that must never be sent (again) — evicted by the server,
+// settled by a message that carried them, or dropped from the local pool. Ids are AUTOINCREMENT,
+// never reused, so the set stays valid for the whole session.
+const deadAttachmentIds = new Set();
+
+function addUploadChip(name, vision, attachmentId) {
   uploadChips.hidden = false;
   const chip = document.createElement("span");
-  chip.className = "upload-chip";
-  chip.textContent = name;  // security: never innerHTML, name is user-supplied
+  chip.className = vision ? "upload-chip vision" : "upload-chip";
+  if (vision) chip.title = tr("attach.vision");
+  if (Number.isInteger(attachmentId)) chip.dataset.attachmentId = String(attachmentId);
+  chip.dataset.name = name;
+  chip.textContent = vision ? `🖼 ${name}` : name;  // security: never innerHTML, name is user-supplied
   uploadChips.appendChild(chip);
 }
 
-// clear the upload chips once sent (the files persist in ./assets regardless).
-function clearUploadChips() {
-  uploadChips.replaceChildren();
-  uploadChips.hidden = true;
+// Restore is only sound when the failure PROVES nothing persisted (an HTTP error status): dedupe
+// by id, order by id (AUTOINCREMENT = upload order — concurrent sends can fail out of order, so
+// reserved is not necessarily older than pending), keep the newest pool-size ids, and downgrade
+// anything dropped so nothing is silently un-promised.
+function restoreReserved(reserved) {
+  const byId = new Map();
+  for (const a of [...reserved, ...pendingAttachments]) {
+    if (!deadAttachmentIds.has(a.id)) byId.set(a.id, a);
+  }
+  const merged = [...byId.values()].sort((x, y) => x.id - y.id);
+  const dropCount = Math.max(0, merged.length - MAX_PENDING_ATTACHMENTS);
+  if (dropCount > 0) downgradeEvictedChips(merged.slice(0, dropCount).map(a => a.id));
+  pendingAttachments = merged.slice(dropCount);
 }
+
+// A network failure's outcome is unknown, and no signal can ever prove the ids were NOT consumed
+// (message.user settlement only proves consumption, and the replay window is bounded) — so the
+// reservation is abandoned, visibly: chips downgrade, ids tombstone, the user re-uploads if the
+// send truly died. Unconsumed server rows are bounded: newer uploads evict them, close/expiry
+// sweeps the rest.
+function abandonReserved(reserved) {
+  downgradeEvictedChips(reserved.map(a => a.id));
+}
+
+// Retires this send's frozen snapshot against the server's consumed set, and returns how many
+// provably did not ride (partial admission). A vision chip a concurrent failed send downgraded after
+// the snapshot keeps its captured numeric id here, so it is not this send's and is left intact.
+function removeSentChips(requested, consumed, chipSnapshot) {
+  const known = Array.isArray(consumed);
+  const consumedSet = new Set(known ? consumed : []);
+  // Known: tombstone the requested ids the server didn't take. Unknown (unreadable 202): the
+  // reservation is already spent (pending was cleared at send start), so none of these can ride a
+  // future message — tombstone them all, and SSE settlement removes any that actually rode. Never
+  // leave a vision chip promising a send it can no longer make.
+  const dropped = known ? requested.filter(id => !consumedSet.has(id)) : requested.slice();
+  if (known) pendingAttachments = pendingAttachments.filter(a => !consumedSet.has(a.id));
+  for (const { node, aid } of chipSnapshot) {
+    if (Number.isNaN(aid) || consumedSet.has(aid)) node.remove();  // plain clears; consumed settles
+  }
+  if (dropped.length) downgradeEvictedChips(dropped);
+  if (uploadChips.children.length === 0) uploadChips.hidden = true;
+  return known ? dropped.length : 0;  // report a partial-admission count only when it is actually known
+}
+
+// An id observed inside a message can never be pending again: drop it and its chip entirely.
+function retireAttachmentId(id) {
+  if (!Number.isInteger(id)) return;
+  deadAttachmentIds.add(id);
+  pendingAttachments = pendingAttachments.filter(a => a.id !== id);
+  (uploadChips.querySelector(`[data-attachment-id="${id}"]`)
+    ?? uploadChips.querySelector(`[data-dead-id="${id}"]`))?.remove();
+  if (uploadChips.children.length === 0) uploadChips.hidden = true;
+}
+
+// The server keeps only the newest pending images; a chip whose attachment was evicted must stop
+// promising it will be sent.
+function downgradeEvictedChips(ids) {
+  for (const id of ids) {
+    deadAttachmentIds.add(id);
+    pendingAttachments = pendingAttachments.filter(a => a.id !== id);
+    const chip = uploadChips.querySelector(`[data-attachment-id="${id}"]`);
+    if (chip) {
+      chip.classList.remove("vision");
+      chip.removeAttribute("title");
+      chip.dataset.deadId = chip.dataset.attachmentId;  // settlement lookup must still find it
+      delete chip.dataset.attachmentId;
+      chip.textContent = chip.dataset.name || chip.textContent;
+    }
+  }
+}
+
 
 async function uploadFiles(fileList) {
   if (!sessionId || !fileList || fileList.length === 0) return;
@@ -1131,7 +1254,12 @@ async function uploadFiles(fileList) {
     }
     const all = Array.isArray(data?.files) ? data.files : [];
     const ok = all.filter(f => !f.error);
-    for (const f of ok) addUploadChip(f.name);
+    for (const f of ok) {
+      const vision = f.vision === true && Number.isInteger(f.attachmentId);
+      addUploadChip(f.name, vision, vision ? f.attachmentId : undefined);
+      if (vision) pendingAttachments.push({ id: f.attachmentId, name: f.name });
+    }
+    if (Array.isArray(data?.evictedAttachments)) downgradeEvictedChips(data.evictedAttachments);
     const failed = all.filter(f => f.error);
     setStatus(failed.length
       ? tr("err.uploadFailed", failed.map(f => f.name).join(", "))

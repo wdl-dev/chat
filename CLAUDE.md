@@ -141,7 +141,8 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   key), `ADMIN_URL` (`https://api.wdl.dev`), `DEMO_PASSCODE` (portal gate), `EXA_API_KEY` (backs `web_search` / `web_fetch`; unset → both
   answer "not configured" and everything else still works); plus the optional
   `LLM_*` overrides (`LLM_API_SHAPE` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_MODEL_LITE` /
-  `LLM_MAX_TOKENS` / `LLM_MAX_TOKENS_PARAM` / `LLM_BUDGET_MS` / `LLM_REASONING_EFFORT`) — these pin
+  `LLM_MAX_TOKENS` / `LLM_MAX_TOKENS_PARAM` / `LLM_BUDGET_MS` / `LLM_REASONING_EFFORT` /
+  `LLM_VISION`) — these pin
   the live provider; see the LLM design decision for the current pick and its constraints
   (`LLM_MAX_TOKENS_PARAM=max_completion_tokens` is required for OpenAI reasoning models).
   `OPERATOR_TOKEN` gates exactly one route — `POST /admin/sessions/<id>/force-close`, via the
@@ -163,7 +164,8 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   after 10min saves compute, but a suspended VM is never idle-terminated before the 6h
   cap), so the only session death is the 6h clock — never a VM reclaimed out from under
   a valid token. Suspended VMs still count against the Lambda "Max allocated memory"
-  quota, so abandoned sessions hold their memory for the full 6h.
+  quota; the session's expiry alarm closes abandoned sessions just past the 6h gate (facets from
+  pre-alarm versions: the full 6h).
 - **Real-time session start, not a preallocated pool.** Users land on `#portal`, enter the
   passcode (`DEMO_PASSCODE`), and `POST /portal/start`, which mints a fresh `tmp-<hex>` ns
   + ns token from auth `/auth/delegated-tokens` (template `wdl-chat-ns-pool`: kind ns,
@@ -172,21 +174,24 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   token self-expires (chat-worker holds only the narrow `token-issuer` credential and
   cannot revoke). Closed sessions are **not reaped** (known limitation): the `sessions_index`
   row + per-session DO SQLite persist until a retention policy is added.
-- **6h hard session lifetime, lazily enforced.** Sessions die at `created_at + 6h - 5min`
+- **6h hard session lifetime: expiry alarm + lazy router gates.** Sessions die at `created_at + 6h - 5min`
   (`DELEGATED_TTL_MS` mirrors the `wdl-chat-ns-pool` template TTL — operator changes to the
-  template must update the constant). There is no reaper: the router's shared gates enforce
-  it on the next request that reaches them — `requireActiveSession` (messages/cancel/approve-plan/upload)
+  template must update the constant). Enforcement is two-layer: the DO expiry alarm (below)
+  proactively runs the full teardown just past the gate (gate+60s), and the router's shared gates enforce lazily on
+  the next request that reaches them — `requireActiveSession` (messages/cancel/approve-plan/upload)
   answers **410 "session expired"**, `proxyGetToDo` (stream/export) answers 404. Body
   parsing/validation runs first, so a malformed write (empty/oversized/bad-JSON → 400/413)
   rejects *before* the gate and does not expire; a session that only ever gets invalid
-  traffic falls back to the broker's 6h max VM lifetime. `expireSession`
+  traffic is closed by the expiry alarm (pre-alarm facets: the broker's 6h max VM lifetime). `expireSession`
   tears down via DO `expire()` (= `_closeSession("expired")`: abort run, terminate VM,
   broadcast `session.closed {reason:"expired"}`), falling back to `requestClose()` for DO
   facets pinned to a pre-`expire()` version, then fences `sessions_index` to `closed`.
-  A run in flight when the deadline passes is aborted at the next workflow step boundary
+  Since upload→vision, `init()` also sets a DO alarm at gate+60s whose handler runs the same
+  `_closeSession("expired")` proactively for abandoned sessions (idempotent; catalog still fenced
+  lazily on next router access). A run in flight when the deadline passes is aborted at the next workflow step boundary
   (`_isCancelled` folds in `_cancelIfExpired` → cancel reason `"expired"`) — that path only
-  stops the run; VM/catalog teardown still waits for the next router access (or the broker's
-  6h max lifetime).
+  stops the run; full teardown follows via the expiry alarm or the next router access (catalog
+  fencing stays with the router).
   `/portal/start` returns `expiresAt` (the gate time); the SPA shows it as a live countdown
   (`#countdown`), disables the composer at 0 client-side, treats any 410 as expiry, and
   explains the expiry on the portal when a dead session is reopened cold. Deliberately no
@@ -300,10 +305,9 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   at identical pricing (probe-verified: images + function tools coexist in one request; max_tokens
   bounds reasoning like the rest of the family) — the `-exp` suffix means DeepSeek may change it
   without notice, so on unexplained behavior shifts suspect the model tier first and fall back to
-  `deepseek-v4-flash` (a two-secret change). NOTHING in wdl-chat sends images yet: neither wire
-  shape maps an image block and the upload flow only writes files into the workspace, so vision is
-  pure latent capability until an upload→message feature (image block in `_buildLlmMessages` +
-  an `image_url` mapping in `llm-openai.js`) lands. `grok-4.5` (xAI direct, effort=low; 4/4 on the July build-only bench — `npm run bench` has since
+  `deepseek-v4-flash` (a two-secret change — plus `LLM_VISION=0`, since plain flash is text-only). Vision is wired end to end (see the
+  upload→vision bullet), but only the vision-exp pair is probe-verified for images+tools in one
+  request — verify per provider before switching. `grok-4.5` (xAI direct, effort=low; 4/4 on the July build-only bench — `npm run bench` has since
   grown to a five-round state machine, so re-measure before citing) and `qwen3.7-max` (Aliyun
   gateway, Anthropic shape) are the vetted alternates.
   Others were measured and dropped — Kimi K3 (~3× slower), GLM-5.2 (spends the whole budget
@@ -416,6 +420,73 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   HTML from the VM, which stays possible). Both are read-only (parallel batch) and **sandboxless**: a
   batch of only these must not boot or wait on a MicroVM (`SANDBOXLESS_TOOLS`). Exa reachability from
   the platform egress is probe-verified (Tokyo, 2026-08-15).
+- **Upload→vision: images attach to the next user message as `image_ref` markers, not inline
+  base64.** Vision is gated by the explicit `LLM_VISION=1`
+  secret (capability is a gateway×model pair property, never inferred from the model name): off, no
+  attachment is stashed (`vision:false`, plain chip) and inflation degrades every marker to
+  placeholder text without reading a body — so a fallback to a text-only model must flip this flag
+  with the model secrets, and the window self-heals. `_handleUpload` magic-byte-sniffs each stored
+  file (png/jpeg/gif/webp; client name/type untrusted); an image ≤ `MAX_VISION_IMAGE_BYTES` (= the per-file upload cap; every upload cap sits under the
+  1 MiB WDL DO transport body limit, since the whole multipart rides one `stub.fetch()`) is also stashed in the DO-local `attachments` table (pending pool
+  pruned to the newest `MAX_VISION_IMAGES_PER_MESSAGE` = 4). Upload answers `vision`/`attachmentId` per
+  file (evictions surface in `evictedAttachments` and downgrade their chips); the SPA sends the ids
+  it holds in `POST /messages` `attachments`, and `addUserMessage` embeds exactly the ids it can
+  still find unconsumed as `{type:"image_ref", id, name, media_type}` blocks before the text and
+  marks them consumed (the 202 echoes the ids actually consumed — a strict subset when some were already gone — and the
+  SPA settles those, keeps the rest as visible dropped tombstones, and reports partial admission; an
+  unreadable 202 body means the consumed set is unknown — the reservation is already spent, so those
+  chips are tombstoned at once (never left promising an impossible send) and SSE settlement removes
+  any that actually rode) —
+  attachment↔message binding is explicit, so an upload finishing after Send can never ride a
+  message it wasn't sent with, and attachment validation runs before the expiry gate like every
+  other body check, and the whole of `addUserMessage` is serialized (an admission chain) so two
+  concurrent sends cannot capture the same run or claim the same attachments, with a post-wake
+  `closed` re-check so a Close/alarm teardown mid-await cannot be admitted over. POST /messages means ADMISSION: once the message is persisted, a workflow
+  launch failure still answers 202 (run.failed is broadcast) so the client retires consumed ids;
+  only the router's own validation rejections (`RESTORE_STATUSES` = 400/404/409/413) prove nothing
+  persisted and restore the reservation (id-sorted, deduped, capped at pool size — out-of-order
+  concurrent failures keep the newest; drops downgrade their chips). Every other outcome — a
+  network failure, or any other status (a gateway/binding 5xx or 408 can arrive after the DO
+  committed) — is unknown, and nothing can ever prove ids were NOT consumed (stream settlement via
+  message.user only proves consumption, and replay is bounded to the newest 50 messages), so that
+  reservation is visibly abandoned — chips downgrade, ids tombstone, orphan server rows are
+  bounded by pool eviction and close/expiry sweep. Message rows, stream replay, and broadcasts
+  carry only the marker — the stream replays the newest `HISTORY_REPLAY_LIMIT` (50) messages on
+  every attach, so inline base64 would ship MBs per reconnect. The single
+  inflation point is `_buildLlmMessages` (covers the run loop AND the plan path): after windowing,
+  markers become real `{type:"image", source:{type:"base64", …}}` blocks under a newest-first
+  total-byte budget (`DEFAULT_IMAGE_BUDGET` 8 MiB/request, decided from the persisted `size` column before any
+  body is read — evicted bodies are never loaded, so peak DO memory tracks the budget, not the
+  window — a window dense with image turns must
+  not cross provider request-body caps; over-budget images degrade to placeholder text); a marker
+  whose row is gone drops (placeholder text if the turn empties — an empty user turn 400s strict
+  providers).
+  The Anthropic wire passes image blocks natively; `toOpenAiBody` maps them to `image_url` data
+  URIs in content-parts form (parts only when images are present — text-only stays a plain string),
+  preserving the original text/image order so each image stays adjacent to its own instruction. `pickModel` counts an image as intent, and a
+  tool continuation stays on the full model while any image is still in the window (the lite tier
+  may lack vision). Oversized images still
+  land in `./assets` (originals are never downscaled or consumed); consumed attachment rows are kept only while
+  their message can still be inflated (`ATTACHMENT_RETENTION_SEQS` > the widest window tail read;
+  older bodies are reclaimed on each new message, and Close/expire drops all attachment rows).
+  `_closeSession` writes `closed` before any external teardown; since a plain SQL write does not
+  roll back, the teardown is only proven done by a `teardownComplete` marker written after its last
+  external step (VM close included), and an alarm that sees `closed` without it re-runs the
+  idempotent `_closeSession` to finish. A caught broker-close failure returns normally (WDL then
+  finalizes the fired alarm and never redelivers), so on incomplete teardown the **alarm path
+  throws** — handing the retry to the platform's own bounded alarm redelivery (exponential backoff,
+  capped tries), which does not depend on a `setAlarm` write landing — while the **RPC Close/expire
+  path**, having no fired alarm to redeliver, schedules one explicitly. Neither self-deletes the
+  alarm (a successful handler is finalized by the platform). `init()` also schedules a DO alarm just past the expiry gate (bounded same-time retries;
+  exhaustion logs and falls back to lazy expiry instead of failing init — the minted session token
+  is unrevocable, so init must not burn its quota over an enhancement): an abandoned session (no further
+  requests, so lazy router expiry never fires) still gets the full expire teardown — the one
+  departure from "no reaper", scoped to expiry; catalog fencing stays lazy. `_handleUpload`
+  re-checks the closed fence after every VM await so an in-flight upload cannot stash past Close's
+  cleanup, and the SPA tombstones evicted ids so a failed send's restore cannot revive them. The SPA reserves its attachment snapshot
+  atomically at send() start (restored on failure), so rapid-fire sends cannot race two messages
+  onto the same ids. Client-side downscale for oversized photos is a known
+  follow-up. Ships with `wdl deploy chat-worker` + frontend (chips/i18n) — no image rebuild.
 - **Parallel read-only tool dispatch.** Contiguous read-only tool_uses (`read_file` /
   `list_files` / `tail_logs` / `web_search` / `web_fetch`, in `READ_ONLY_TOOLS`) run in a Promise.all batch with one
   shared AbortController. Effectful tools (`write_file` / `edit_file` / `run_command` / `deploy_test` /
@@ -465,7 +536,7 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
   AGENTS.md does teach it — an AI iterating on a generated DO worker otherwise `call_preview`s its
   own stale facet and reads the result as "my fix did nothing".
 - **Stream replay.** `GET /stream` (WebSocket or SSE) re-emits, on every (re)attach, the
-  message history (frontend de-dups by `seq`), the current run's state (`run.scheduled`, mode
+  newest `HISTORY_REPLAY_LIMIT` (50) messages (frontend de-dups by `seq`), the current run's state (`run.scheduled`, mode
   derived from whether it's parked at plan), and the plan card if parked. It picks the
   **newest run by start time** (not the latest still-active one), so a superseded run that
   outlives a newer completed one doesn't replay a stale status. Tool activity is rendered from
@@ -514,9 +585,17 @@ steps(run_id, step_no, kind, input, output, status, started_at, ended_at)
 - **chat.wdl.dev is a pattern host — the path is NOT stripped.** The SPA must use absolute
   `/api/...` URLs (the worker proxies `/api/*` to chat-worker); relative paths or a
   `/chat/api/...` prefix break.
-- **The stream replays history on every attach** (server-side, over WebSocket or SSE;
+- **The stream replays the newest 50 messages on every attach** (server-side, over WebSocket or SSE;
   EventSource also auto-reconnects). The frontend de-dups by `seq` (`renderedMessageSeqs`);
   don't remove it or every reconnect double-renders.
+- **Every upload cap sits under the 1 MiB WDL DO transport body limit.** The whole multipart rides
+  one `stub.fetch()` into the DO, and the transport hard-caps that body at
+  `MAX_DO_REQUEST_BODY_BYTES` (1 MiB) — raising `MAX_UPLOAD_FILE_BYTES` / `MAX_UPLOAD_TOTAL_BYTES` /
+  `MAX_VISION_IMAGE_BYTES` above it produces dead letters, not bigger uploads (the pre-vision
+  MB-scale values could never have worked). Content-length is only a pre-check: it can be absent or
+  false, so `handleUpload` also converts the transport's own `TypeError: ...fetch body exceeds N
+  bytes` into a 413 — without that the caller sees an opaque 500. Going bigger needs chunked or
+  pointer-style transfer, not a larger constant.
 - **The `Close` button is the universal escape hatch** — `requestClose` aborts the in-flight
   LLM and tears down the session (and terminates the MicroVM). When Stop appears stuck (DO on
   a pre-fix version), tell the user to Close.

@@ -45,14 +45,23 @@ export function resolveLlmConfig(env) {
   };
 }
 
+// Explicit capability config: vision is a (gateway, model) pair property that cannot be inferred
+// from a model name, so attachment stashing, UI hints, and inflation all key off this one flag.
+export function visionEnabled(env) {
+  return env?.LLM_VISION === "1";
+}
+
 export function pickModel(messages, cfg) {
   const last = messages?.[messages.length - 1];
   if (!last || last.role !== "user") return cfg.model;
   const content = last.content;
   if (typeof content === "string") return cfg.model;
   if (!Array.isArray(content)) return cfg.model;
-  const hasText = content.some(b => b?.type === "text");
-  return hasText ? cfg.model : cfg.modelLite;
+  const hasIntent = content.some(b => b?.type === "text" || b?.type === "image");
+  if (hasIntent) return cfg.model;
+  // A continuation still replaying images must stay on the vision-capable tier (lite may lack it).
+  const hasImage = messages.some(m => Array.isArray(m?.content) && m.content.some(b => b?.type === "image"));
+  return hasImage ? cfg.model : cfg.modelLite;
 }
 
 function pickString(v, fallback) {

@@ -68,9 +68,10 @@ short-lived JWE, push the session context to the in-VM sandbox-agent's `/init`,
 and hand `{ endpoint, authToken }` back. chat-worker then talks to the MicroVM's
 public HTTPS endpoint directly (with `X-aws-proxy-auth`) to run commands and
 deploy. On close, `broker.closeSession` terminates the VM. Sessions also have a
-hard 6-hour lifetime (the ns-token TTL): past it the router lazily expires the
-session on the next request (gated writes get `410`, stream/export `404`) and the
-VM's own 6h max-lifetime reaps it. No standing pool, no leases, no mesh.
+hard 6-hour lifetime (the ns-token TTL): past it a DO alarm proactively
+closes the session (VM terminated), the router also lazily expires it on the next
+request (gated writes get `410`, stream/export `404`), and the VM's own 6h
+max-lifetime is the last-resort backstop. No standing pool, no leases, no mesh.
 
 ## Deploy
 
@@ -94,6 +95,9 @@ You need two credentials from your WDL platform operator: (1) a normal per-ns to
    # provider set the whole LLM_* group together: LLM_API_SHAPE / LLM_BASE_URL / LLM_MODEL /
    # LLM_MODEL_LITE (+ LLM_MAX_TOKENS_PARAM=max_completion_tokens for OpenAI reasoning models —
    # the default max_tokens 400s them). A bare key with no overrides is sent to DeepSeek.
+   # LLM_VISION=1 (optional) turns on image attachments; set it ONLY when the configured models
+   # accept image input (e.g. deepseek-v4-flash-vision-exp) and flip it with any model change —
+   # unset/0, uploads still land in ./assets but are never sent to the model.
 4. bash scripts/deploy-workers.sh    # deploy chat-worker, then frontend (re-pins the CHAT binding)
 5. open https://chat.wdl.dev/
 ```

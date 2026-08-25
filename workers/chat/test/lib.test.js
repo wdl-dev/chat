@@ -1,19 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import {
-  bytesToBase64,
-  capText,
-  extractText,
-  httpError,
-  isRedispatchError,
-  jsonResponse,
-  requireSecretEqual,
-  safeUploadName,
-  sseEvent,
-  timingSafeStringEqual,
-  toolResultBlock,
-  uniqueUploadName,
-} from "../src/lib.js";
+import { bytesToBase64, capText, extractText, httpError, isRedispatchError, jsonResponse, requireSecretEqual, safeUploadName, sniffImageType, sseEvent, timingSafeStringEqual, toolResultBlock, uniqueUploadName } from "../src/lib.js";
 
 test("toolResultBlock stringifies non-string output + coerces is_error", () => {
   assert.deepEqual(toolResultBlock("tu1", { ok: 1 }, false), {
@@ -185,4 +172,18 @@ test("toolResultBlock caps oversized content", () => {
   const block = toolResultBlock("t1", huge, false);
   assert.ok(block.content.length < huge.length, "capped");
   assert.match(block.content, /truncated/);
+});
+
+test("sniffImageType: magic bytes decide, not names or claimed types", () => {
+  assert.equal(sniffImageType(Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])), "image/png");
+  assert.equal(sniffImageType(Uint8Array.from([0xff, 0xd8, 0xff, 0xe0])), "image/jpeg");
+  assert.equal(sniffImageType(new TextEncoder().encode("GIF89a")), "image/gif");
+  const webp = new Uint8Array(12);
+  webp.set(new TextEncoder().encode("RIFF"), 0);
+  webp.set(new TextEncoder().encode("WEBP"), 8);
+  assert.equal(sniffImageType(webp), "image/webp");
+  assert.equal(sniffImageType(new TextEncoder().encode("RIFF....WAVE")), null);
+  assert.equal(sniffImageType(new TextEncoder().encode("<svg xmlns=")), null);
+  assert.equal(sniffImageType(new Uint8Array(0)), null);
+  assert.equal(sniffImageType(Uint8Array.from([0xff, 0xd8]).buffer), null);
 });

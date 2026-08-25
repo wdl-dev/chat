@@ -18,10 +18,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const MAX_JSON_BODY_BYTES = 256 * 1024; // bounds JSON body parse cost (>> the 50KB message cap)
 const MAX_USER_MESSAGE_BYTES = 50_000;
-const MAX_UPLOAD_BODY_BYTES = 16 * 1024 * 1024;
+const MAX_UPLOAD_BODY_BYTES = 1024 * 1024; // the WDL DO transport caps a stub.fetch() body at 1 MiB
 
 const SESSION_ROUTE = /^\/sessions\/([^/]+)(?:\/(messages|cancel|close|stream|approve-plan|export|upload))?$/;
 const MAX_PLAN_NOTE_BYTES = 5000;
+const MAX_MESSAGE_ATTACHMENTS = 4; // mirrors the DO's MAX_VISION_IMAGES_PER_MESSAGE
 const PLAN_DECISIONS = new Set(["approve", "revise", "reject"]);
 const ADMIN_SESSION_FORCE_CLOSE = /^\/admin\/sessions\/([^/]+)\/force-close$/;
 
@@ -163,9 +164,20 @@ async function handlePostMessage(env, sessionId, body) {
   if (bytes > MAX_USER_MESSAGE_BYTES) {
     throw httpError(413, `content too large (${bytes} > ${MAX_USER_MESSAGE_BYTES} bytes)`);
   }
+  // Full attachment validation belongs with body validation, BEFORE the expiry gate: a malformed
+  // write must 400 without triggering lazy session teardown.
+  const attachments = body.attachments;
+  if (attachments !== undefined
+    && (!Array.isArray(attachments) || attachments.some(a => !Number.isInteger(a))
+      || new Set(attachments).size > MAX_MESSAGE_ATTACHMENTS)) {
+    throw httpError(400, "invalid attachments");
+  }
   await requireActiveSession(env, sessionId);
   const mode = body?.mode === "plan_confirmed" ? "plan_confirmed" : "free_form";
-  const result = await getDoStub(env, sessionId).addUserMessage({ content: body.content, mode });
+  // Never put an explicit undefined property in the JSRPC payload — the serializer rejects it.
+  const result = await getDoStub(env, sessionId).addUserMessage(
+    attachments === undefined ? { content: body.content, mode } : { content: body.content, mode, attachments },
+  );
   return jsonResponse(202, result);
 }
 
@@ -235,7 +247,16 @@ async function handleUpload(req, env, sessionId) {
   if (Number.isFinite(len) && len > MAX_UPLOAD_BODY_BYTES) {
     throw httpError(413, `upload too large (max ${MAX_UPLOAD_BODY_BYTES} bytes)`);
   }
-  return await getDoStub(env, sessionId).fetch(new Request("https://do/upload", req));
+  try {
+    return await getDoStub(env, sessionId).fetch(new Request("https://do/upload", req));
+  } catch (err) {
+    // A missing/false Content-Length slips past the pre-check; the transport counts the real stream
+    // and throws a TypeError once it crosses the 1 MiB DO body cap — surface that as 413, not 500.
+    if (err instanceof TypeError && /fetch body exceeds/.test(String(err?.message))) {
+      throw httpError(413, `upload too large (max ${MAX_UPLOAD_BODY_BYTES} bytes)`);
+    }
+    throw err;
+  }
 }
 
 function operatorGate(req, env) {

@@ -40,8 +40,8 @@ tests/e2e/            联机 e2e(单测在各 worker 旁边)
 `/init`，然后把 `{ endpoint, authToken }` 交回 chat-worker。chat-worker 之后直连
 MicroVM 的公网 HTTPS endpoint（带 `X-aws-proxy-auth`）跑命令 / 部署。Close 时
 `broker.closeSession` terminate 掉 VM。session 另有 6 小时硬生命周期（ns token TTL）：
-超时后 router 在下次请求时惰性终止（写路径 `410`，stream/export `404`），VM 自身的
-6h max-lifetime 兜底回收。无长驻池、无 lease、无 mesh。
+超时后 DO alarm 主动关闭 session（含 terminate VM），router 在下次请求时也会惰性终止
+（写路径 `410`，stream/export `404`），VM 自身的 6h max-lifetime 是最后兜底。无长驻池、无 lease、无 mesh。
 
 ## 部署链路
 
@@ -63,6 +63,8 @@ MicroVM 的公网 HTTPS endpoint（带 `X-aws-proxy-auth`）跑命令 / 部署�
    # LLM_API_KEY 必须匹配默认 provider(DeepSeek,Anthropic 线)。换 provider 要整组一起设:
    # LLM_API_SHAPE / LLM_BASE_URL / LLM_MODEL / LLM_MODEL_LITE(OpenAI reasoning 模型还要
    # LLM_MAX_TOKENS_PARAM=max_completion_tokens,默认 max_tokens 会被它们 400)。只设 key 会被发往 DeepSeek。
+   # LLM_VISION=1(可选)开启图片附件;仅当所配模型接受图片输入时才设(如 deepseek-v4-flash-vision-exp),
+   # 换模型时必须一起翻转——不设/为 0 时,上传仍进 ./assets,但不会发给模型。
 4. bash scripts/deploy-workers.sh    # 部署 chat-worker 然后 frontend(re-pin CHAT binding)
 5. 访问 https://chat.wdl.dev/
 ```

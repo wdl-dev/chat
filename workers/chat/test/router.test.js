@@ -306,3 +306,67 @@ test("portal/start rolls back the session index when DO init fails", async () =>
   assert.equal(res.status, 502);
   assert.equal(closed, true, "must mark the session closed on init failure");
 });
+
+test("POST messages rejects malformed attachments", async () => {
+  for (const attachments of ["1", { a: 1 }, [1, "2"], [1.5], Array.from({ length: 9 }, (_, i) => i)]) {
+    const res = await handleRequest(
+      req("POST", "/sessions/s1/messages", { json: { content: "hi", attachments } }),
+      makeEnv(),
+    );
+    assert.equal(res.status, 400, JSON.stringify(attachments));
+  }
+});
+
+test("POST messages passes valid attachments through to the DO", async () => {
+  let seen;
+  const env = makeEnv({ do: { addUserMessage: async (args) => { seen = args; return { runId: "r1", seq: 1, mode: "free_form" }; } } });
+  const res = await handleRequest(
+    req("POST", "/sessions/s1/messages", { json: { content: "hi", attachments: [3, 7] } }),
+    env,
+  );
+  assert.equal(res.status, 202);
+  assert.deepEqual(seen.attachments, [3, 7]);
+  // Without attachments the key must be absent entirely: JSRPC rejects explicit undefined values.
+  await handleRequest(req("POST", "/sessions/s1/messages", { json: { content: "hi" } }), env);
+  assert.ok(!("attachments" in seen));
+});
+
+test("POST messages with malformed attachments 400s before the expiry gate (no lazy teardown)", async () => {
+  const { env, flags } = dbEnv({ createdAt: 0 });
+  const res = await handleRequest(
+    req("POST", "/sessions/s1/messages", { json: { content: "hi", attachments: "bad" } }),
+    env,
+  );
+  assert.equal(res.status, 400);
+  assert.ok(!flags.expired, "expire() must not run for a malformed write");
+  assert.ok(!flags.closedInDb, "catalog must stay untouched for a malformed write");
+});
+
+test("POST messages rejects more than 4 distinct attachment ids", async () => {
+  const res = await handleRequest(
+    req("POST", "/sessions/s1/messages", { json: { content: "hi", attachments: [1, 2, 3, 4, 5] } }),
+    makeEnv(),
+  );
+  assert.equal(res.status, 400);
+  const dupes = await handleRequest(
+    req("POST", "/sessions/s1/messages", { json: { content: "hi", attachments: [1, 1, 1, 1, 1] } }),
+    makeEnv(),
+  );
+  assert.equal(dupes.status, 202);
+});
+
+test("POST upload maps a transport body-too-large TypeError to 413, not 500", async () => {
+  const env = makeEnv({ do: { fetch: async () => {
+    throw new TypeError("Durable Object fetch body exceeds 1048576 bytes");
+  } } });
+  const upload = new Request("https://chat.local/sessions/s1/upload", { method: "POST", body: "x" });
+  const res = await handleRequest(upload, env);
+  assert.equal(res.status, 413);
+});
+
+test("POST upload does not swallow an unrelated TypeError as 413", async () => {
+  const env = makeEnv({ do: { fetch: async () => { throw new TypeError("boom"); } } });
+  const upload = new Request("https://chat.local/sessions/s1/upload", { method: "POST", body: "x" });
+  const res = await handleRequest(upload, env);
+  assert.equal(res.status, 500);
+});

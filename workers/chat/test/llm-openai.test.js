@@ -503,3 +503,53 @@ test("bare-CR line terminators still frame the stream", async () => {
   assert.equal(r.content.find(b => b.type === "text").text, "hi");
   assert.equal(r.stop_reason, "end_turn");
 });
+
+test("toOpenAiBody: user image blocks become image_url data URIs in content-parts form", () => {
+  const body = toOpenAiBody({
+    messages: [{ role: "user", content: [
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "QUJD" } },
+      { type: "text", text: "make this page" },
+    ] }],
+    model: "m", maxTokens: 10,
+  });
+  assert.deepEqual(body.messages[0], {
+    role: "user",
+    content: [
+      { type: "image_url", image_url: { url: "data:image/png;base64,QUJD" } },
+      { type: "text", text: "make this page" },
+    ],
+  });
+});
+
+test("toOpenAiBody: image-only user turn keeps parts form; tool messages still precede it", () => {
+  const body = toOpenAiBody({
+    messages: [{ role: "user", content: [
+      { type: "tool_result", tool_use_id: "t1", content: "r" },
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "ZZ" } },
+    ] }],
+    model: "m", maxTokens: 10,
+  });
+  assert.equal(body.messages[0].role, "tool");
+  assert.deepEqual(body.messages[1], {
+    role: "user",
+    content: [{ type: "image_url", image_url: { url: "data:image/jpeg;base64,ZZ" } }],
+  });
+});
+
+test("toOpenAiBody: interleaved image/text parts keep their original order (image stays with its text)", () => {
+  const body = toOpenAiBody({
+    messages: [{ role: "user", content: [
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "AA" } },
+      { type: "text", text: "first" },
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "BB" } },
+      { type: "text", text: "second" },
+    ] }],
+    model: "m", maxTokens: 10,
+  });
+  assert.deepEqual(body.messages[0].content, [
+    { type: "image_url", image_url: { url: "data:image/png;base64,AA" } },
+    { type: "text", text: "first" },
+    { type: "image_url", image_url: { url: "data:image/jpeg;base64,BB" } },
+    { type: "text", text: "second" },
+  ]);
+});

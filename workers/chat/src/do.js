@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
-import { bytesToBase64, capText, errMessage, extractText, httpError, jsonResponse, newRunId, parseJson, safeUploadName, sseEvent, toolResultBlock, uniqueUploadName } from "./lib.js";
-import { callLlmMessages, resolveLlmConfig } from "./llm.js";
-import { hasAnswerContent, isUserTextTurn, replayLlmTurnOutcome, replayPlanOutcome, toolBatchAlreadyRan, windowLlmMessages } from "./messages.js";
+import { bytesToBase64, capText, errMessage, extractText, httpError, jsonResponse, newRunId, parseJson, safeUploadName, sseEvent, toolResultBlock, uniqueUploadName, sniffImageType } from "./lib.js";
+import { callLlmMessages, resolveLlmConfig, visionEnabled } from "./llm.js";
+import { hasAnswerContent, isUserTextTurn, replayLlmTurnOutcome, replayPlanOutcome, toolBatchAlreadyRan, windowLlmMessages, inflateImageRefs } from "./messages.js";
 import { decideStartRun, isTerminalRunStatus } from "./runstate.js";
 import { dispatchTool, uploadAsset } from "./tools.js";
 import { TOOL_DEFINITIONS, promptPack, isInternalMarker } from "./agent-prompt.js";
@@ -40,6 +40,15 @@ const SCHEMA = [
     ended_at   INTEGER,
     PRIMARY KEY (run_id, step_no)
   )`,
+  `CREATE TABLE IF NOT EXISTS attachments (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL,
+    media_type   TEXT NOT NULL,
+    size         INTEGER,
+    created_at   INTEGER NOT NULL,
+    consumed_seq INTEGER,
+    data         TEXT NOT NULL
+  )`,
   `CREATE INDEX IF NOT EXISTS runs_status ON runs(status, started_at)`,
 ];
 
@@ -53,9 +62,20 @@ const SANDBOXLESS_TOOLS = new Set(["web_search", "web_fetch"]);
 const REPLAY_SAFE_TOOLS = new Set([...READ_ONLY_TOOLS, "write_file"]);
 
 const MAX_UPLOAD_FILES = 10;
-const MAX_UPLOAD_FILE_BYTES = 5 * 1024 * 1024;
-const MAX_UPLOAD_TOTAL_BYTES = 15 * 1024 * 1024;
+// The whole multipart rides one stub.fetch() body, hard-capped at 1 MiB by the DO transport, so
+// every upload cap lives under it with room for multipart framing.
+const MAX_UPLOAD_BODY_BYTES = 1024 * 1024;
+const MAX_UPLOAD_FILE_BYTES = 1_000_000;
+const MAX_UPLOAD_TOTAL_BYTES = 1_000_000;
 const MAX_ASSETS_INDEX = 50;
+const MAX_VISION_IMAGES_PER_MESSAGE = 4;
+// Raw bytes; the stored base64 (~4/3x) must stay under the SQLite per-value bound.
+const MAX_VISION_IMAGE_BYTES = MAX_UPLOAD_FILE_BYTES; // any acceptable upload can be a vision image
+// Consumed attachment bodies are reclaimable once their message can no longer be inflated; must
+// exceed the widest _buildLlmMessages tail read (maxMessages 60 -> 60*2+16 rows).
+const ATTACHMENT_RETENTION_SEQS = 150;
+// Delay before the RPC Close/expire path's explicit teardown-retry alarm (see _scheduleTeardownRetry).
+const CLOSE_RETRY_DELAY_MS = 60_000;
 const MAX_TOOL_USES_PER_TURN = 16;
 const EXPORT_FETCH_TIMEOUT_MS = 120_000; // DO→agent /export budget (agent tar has its own wall-clock)
 const PERSIST_STEP_FIELD_CAP = 128 * 1024;
@@ -108,11 +128,14 @@ export class ChatSessionDO extends DurableObject {
     this.abortControllers = new Map(); // runId -> Set<AbortController>
     this._toolBatchInFlight = new Map();
     this._llmTurnInFlight = new Map();
+    this._admissionChain = Promise.resolve(); // serializes addUserMessage across interleaving awaits
     this._planLlmInFlight = new Map();
     this._markerInFlight = new Map();
     this._ensureInFlight = new Map();
     state.blockConcurrencyWhile(async () => {
       for (const stmt of SCHEMA) this.sql.exec(stmt);
+      // A facet restart can adopt new code over a pre-`size` attachments table.
+      try { this.sql.exec("ALTER TABLE attachments ADD COLUMN size INTEGER"); } catch { /* column exists */ }
     });
     state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
@@ -165,14 +188,46 @@ export class ChatSessionDO extends DurableObject {
     this._writeMeta("sessionId", sessionId);
     this._writeMeta("ns", ns);
     this._writeMeta("nsToken", nsToken);
-    if (Number.isFinite(expiresAt)) this._writeMeta("expiresAt", String(expiresAt));
+    if (Number.isFinite(expiresAt)) {
+      this._writeMeta("expiresAt", String(expiresAt));
+      // An abandoned session never sends another request, so only this alarm runs the expiry
+      // teardown; the router's lazy gate still fences the catalog. On setAlarm failure fall back to
+      // lazy expiry rather than fail init — the ns token is already minted and unrevocable, so a
+      // throw here would burn its active quota for ~6h.
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try { await this.state.storage.setAlarm(expiresAt + 60_000); break; }
+        catch (err) {
+          if (attempt === 3) console.warn(`setAlarm failed; lazy expiry only: ${errMessage(err)}`);
+        }
+      }
+    }
     this._writeMeta("lang", lang === "zh" ? "zh" : "en");
     return { ok: true };
   }
 
-  async addUserMessage({ content, mode }) {
+  async addUserMessage(args) {
+    // Serialize admission end to end: the _wakePlanWait / _launchWorkflow awaits otherwise let two
+    // concurrent sends capture the same active run (leaving two uncancelled runs) and both claim the
+    // same pending attachments. Chaining runs each admission to completion before the next starts.
+    const prior = this._admissionChain;
+    let release;
+    this._admissionChain = new Promise((r) => { release = r; });
+    try { await prior; } catch { /* a prior admission's rejection belongs to its own caller */ }
+    try { return await this._admitUserMessage(args); }
+    finally { release(); }
+  }
+
+  async _admitUserMessage({ content, mode, attachments }) {
     if (this._readMeta("closed")) throw httpError(409, "session closed");
     if (typeof content !== "string" || !content) throw httpError(400, "content required");
+    if (attachments !== undefined
+      && (!Array.isArray(attachments) || attachments.some(a => !Number.isInteger(a)))) {
+      throw httpError(400, "invalid attachments");
+    }
+    const attIds = [...new Set(attachments ?? [])];
+    if (attIds.length > MAX_VISION_IMAGES_PER_MESSAGE) {
+      throw httpError(400, `too many attachments (max ${MAX_VISION_IMAGES_PER_MESSAGE})`);
+    }
     const now = Date.now();
 
     // Every tool_use needs a matching tool_result in the next user turn (API 400s otherwise).
@@ -183,25 +238,47 @@ export class ChatSessionDO extends DurableObject {
       this._cancelRun(activeRunId, "user_supersede");
       await this._wakePlanWait(activeRunId);
     }
+    // Close/alarm can finish teardown during the wake await; don't admit into a torn-down session.
+    if (this._readMeta("closed")) throw httpError(409, "session closed");
 
-    const seq = this._insertMessage("user", [{ type: "text", text: content }], now);
+    const pendingImages = attIds.length === 0 ? [] : [...this.sql.exec(
+      "SELECT id, name, media_type FROM attachments WHERE consumed_seq IS NULL AND id IN "
+        + `(${attIds.map(() => "?").join(",")}) ORDER BY id`,
+      ...attIds,
+    )];
+    const blocks = [
+      ...pendingImages.map(a => ({ type: "image_ref", id: a.id, name: a.name, media_type: a.media_type })),
+      { type: "text", text: content },
+    ];
+    const seq = this._insertMessage("user", blocks, now);
+    for (const a of pendingImages) {
+      this.sql.exec("UPDATE attachments SET consumed_seq = ? WHERE id = ?", seq, a.id);
+    }
+    // Reclaim consumed bodies that fell out of every possible inflation window (markers degrade to
+    // the unavailable placeholder if ever referenced again).
+    this.sql.exec(
+      "DELETE FROM attachments WHERE consumed_seq IS NOT NULL AND consumed_seq < ?",
+      seq - ATTACHMENT_RETENTION_SEQS,
+    );
     const runId = newRunId();
     const runMode = mode === "plan_confirmed" ? "plan_confirmed" : "free_form";
     this.sql.exec(
       "INSERT INTO runs (run_id, status, cancel_requested, started_at) VALUES (?, 'pending', 0, ?)",
       runId, now,
     );
-    this._broadcast("message.user", { seq, content, createdAt: now });
+    this._broadcast("message.user", { seq, content: blocks, createdAt: now });
     this._broadcast("run.scheduled", { runId, mode: runMode });
     try {
       await this._launchWorkflow(runId, runMode);
     } catch (err) {
+      // The message is already persisted and its attachments consumed — admission succeeded, the
+      // RUN failed (broadcast above). Throwing here would 500 the client into treating admission
+      // as failed and re-sending consumed ids.
       console.warn(`workflow launch failed: ${errMessage(err)}`);
       this._endRun(runId, "failed", "workflow launch failed");
       this._broadcast("run.failed", { runId, error: "workflow launch failed" });
-      throw err;
     }
-    return { runId, seq, mode: runMode };
+    return { runId, seq, mode: runMode, attachments: pendingImages.map(a => a.id) };
   }
 
   async _launchWorkflow(runId, mode) {
@@ -265,11 +342,42 @@ export class ChatSessionDO extends DurableObject {
   }
 
   async requestClose() {
-    return this._closeSession("user_close");
+    const { teardownComplete } = await this._closeSession("user_close");
+    if (!teardownComplete) await this._scheduleTeardownRetry();
+    return { ok: true };
+  }
+
+  // At-least-once and possibly late; every branch is idempotent. `closed` is written before any
+  // external teardown and a plain SQL write doesn't roll back, so a wake that sees `closed` without
+  // the teardownComplete marker (written after the last external step) must FINISH the close, not
+  // assume it happened.
+  async alarm() {
+    const closed = this._readMeta("closed");
+    if (closed && this._readMeta("teardownComplete")) {
+      try { this.sql.exec("DELETE FROM attachments"); } catch { /* already clean */ }
+      return;
+    }
+    if (!closed && !this._expiredNow()) {
+      const exp = Number(this._readMeta("expiresAt"));
+      if (Number.isFinite(exp) && exp > 0) await this.state.storage.setAlarm(exp + 60_000);
+      return;
+    }
+    const { teardownComplete } = await this._closeSession("expired");
+    // Throw so the platform redelivers this alarm (bounded) — no dependency on a setAlarm write.
+    if (!teardownComplete) throw new Error("session teardown incomplete; awaiting alarm redelivery");
   }
 
   async expire() {
-    return this._closeSession("expired");
+    const { teardownComplete } = await this._closeSession("expired");
+    if (!teardownComplete) await this._scheduleTeardownRetry();
+    return { ok: true };
+  }
+
+  // RPC path only: no fired alarm to redeliver, so schedule one. Failure is logged, not fatal — a
+  // still-pending init alarm or the next router access backstops, and the 6h VM cap is the floor.
+  async _scheduleTeardownRetry() {
+    try { await this.state.storage.setAlarm(Date.now() + CLOSE_RETRY_DELAY_MS); }
+    catch (err) { console.warn(`teardown retry setAlarm failed: ${errMessage(err)}`); }
   }
 
   async _closeSession(reason) {
@@ -281,6 +389,7 @@ export class ChatSessionDO extends DurableObject {
       // terminate() skips _endRun, so settle here or the row stays pending forever.
       this._endRun(activeRunId, "aborted");
     }
+    let teardownComplete = true;
     const microvmId = this._readMeta("microvmId");
     if (microvmId) {
       let vmClosed = true;
@@ -291,8 +400,13 @@ export class ChatSessionDO extends DurableObject {
         this._writeMeta("microvmId", "");
         this._writeMeta("microvmEndpoint", "");
         this._writeMeta("microvmAuthToken", "");
+      } else {
+        teardownComplete = false; // a redelivered alarm re-runs this to retry the broker close
       }
     }
+    // No further LLM calls can happen; drop the image bodies (the transcript keeps its markers,
+    // and closed-session rows are otherwise never reaped).
+    try { this.sql.exec("DELETE FROM attachments"); } catch (err) { console.warn(`attachment cleanup failed: ${errMessage(err)}`); }
     this._broadcast("session.closed", { reason });
     for (const ctl of this.subscribers) {
       try { ctl.close(); } catch { /* peer gone */ }
@@ -301,7 +415,10 @@ export class ChatSessionDO extends DurableObject {
     for (const ws of this.state.getWebSockets()) {
       try { ws.close(1000, "session closed"); } catch { /* peer gone */ }
     }
-    return { ok: true };
+    // Proves every external step above ran; a later alarm sees it and stops retrying. The retry
+    // itself is the caller's (alarm throws, RPC schedules).
+    if (teardownComplete) this._writeMeta("teardownComplete", "1");
+    return { ok: true, teardownComplete };
   }
 
   async fetch(req) {
@@ -878,7 +995,15 @@ export class ChatSessionDO extends DurableObject {
       catch { content = [{ type: "text", text: row.content }]; }
       return { role: row.role, content };
     });
-    return windowLlmMessages(raw, opts);
+    return inflateImageRefs(windowLlmMessages(raw, opts), {
+      // size is persisted and stored before data, so the meta pass never walks the base64 overflow
+      // pages (SQLite length(TEXT) is a character count and reads the whole string). COALESCE covers
+      // rows a pre-`size` facet inserted before a restart adopted this code.
+      meta: (id) => firstRow(this.sql.exec(
+        "SELECT media_type, COALESCE(size, length(data)) AS size FROM attachments WHERE id = ?", id,
+      )),
+      data: (id) => firstRow(this.sql.exec("SELECT data FROM attachments WHERE id = ?", id))?.data,
+    }, { vision: visionEnabled(this.env) });
   }
 
   _nextStepNo(runId) {
@@ -1009,6 +1134,7 @@ export class ChatSessionDO extends DurableObject {
     if (!this._readMeta("microvmId")) return jsonResponse(409, { error: "nothing to export yet" });
     try { await this._ensureSandbox(); }
     catch (err) { console.warn(`sandbox open failed: ${errMessage(err)}`); return jsonResponse(503, { error: "sandbox unavailable" }); }
+    if (this._readMeta("closed")) return jsonResponse(409, { error: "session closed" });
     const endpoint = this._readMeta("microvmEndpoint");
     const authToken = this._readMeta("microvmAuthToken");
     const ns = this._readMeta("ns");
@@ -1036,8 +1162,8 @@ export class ChatSessionDO extends DurableObject {
   // POST /upload — write user materials (multipart) to ./assets on the MicroVM.
   async _handleUpload(req) {
     const declaredLen = Number(req.headers.get("content-length"));
-    if (Number.isFinite(declaredLen) && declaredLen > MAX_UPLOAD_TOTAL_BYTES + (1 << 20)) {
-      return jsonResponse(413, { error: `upload total too large (max ${MAX_UPLOAD_TOTAL_BYTES} bytes)` });
+    if (Number.isFinite(declaredLen) && declaredLen > MAX_UPLOAD_BODY_BYTES) {
+      return jsonResponse(413, { error: `upload too large (max ${MAX_UPLOAD_BODY_BYTES} bytes)` });
     }
     let form;
     try { form = await req.formData(); }
@@ -1048,6 +1174,7 @@ export class ChatSessionDO extends DurableObject {
 
     const files = [];
     const usedNames = new Set();
+    const visionOn = visionEnabled(this.env);
     let total = 0;
     for (const f of entries) {
       const buf = await f.arrayBuffer();
@@ -1060,7 +1187,8 @@ export class ChatSessionDO extends DurableObject {
       }
       const name = uniqueUploadName(safeUploadName(f.name), usedNames);
       usedNames.add(name);
-      files.push({ name, contentBase64: bytesToBase64(buf) });
+      const visionType = visionOn && buf.byteLength <= MAX_VISION_IMAGE_BYTES ? sniffImageType(buf) : null;
+      files.push({ name, contentBase64: bytesToBase64(buf), visionType });
     }
 
     try { await this._ensureSandbox(); }
@@ -1068,13 +1196,43 @@ export class ChatSessionDO extends DurableObject {
     const ctx = this._buildToolCtx();
     const results = [];
     const stored = [];
+    const evictedAttachments = [];
     for (const f of files) {
       const r = await uploadAsset(ctx, f.name, f.contentBase64);
+      // Close can land while uploadAsset is in flight; a stash after its cleanup would leak forever.
+      if (this._readMeta("closed")) return jsonResponse(409, { error: "session closed" });
       if (r?.error) results.push({ name: f.name, error: r.error });
-      else { results.push({ name: f.name, bytes: r.bytes ?? null }); stored.push(f.name); }
+      else {
+        const vision = f.visionType ? this._stashVisionAttachment(f) : null;
+        if (vision) evictedAttachments.push(...vision.evicted);
+        results.push({
+          name: f.name, bytes: r.bytes ?? null, vision: Boolean(vision),
+          ...(vision ? { attachmentId: vision.id } : {}),
+        });
+        stored.push(f.name);
+      }
     }
     if (stored.length) this._recordAssets(stored);
-    return jsonResponse(200, { ok: results.every(r => !r.error), files: results });
+    return jsonResponse(200, {
+      ok: results.every(r => !r.error),
+      files: results,
+      ...(evictedAttachments.length ? { evictedAttachments } : {}),
+    });
+  }
+
+  _stashVisionAttachment(f) {
+    this.sql.exec(
+      "INSERT INTO attachments (name, media_type, size, data, created_at) VALUES (?, ?, ?, ?, ?)",
+      f.name, f.visionType, f.contentBase64.length, f.contentBase64, Date.now(),
+    );
+    const id = firstRow(this.sql.exec("SELECT last_insert_rowid() AS id")).id;
+    const evicted = [...this.sql.exec(
+      "SELECT id FROM attachments WHERE consumed_seq IS NULL AND id NOT IN " +
+      "(SELECT id FROM attachments WHERE consumed_seq IS NULL ORDER BY id DESC LIMIT ?)",
+      MAX_VISION_IMAGES_PER_MESSAGE,
+    )].map(r => r.id);
+    for (const e of evicted) this.sql.exec("DELETE FROM attachments WHERE id = ?", e);
+    return { id, evicted };
   }
 
   _readAssets() {

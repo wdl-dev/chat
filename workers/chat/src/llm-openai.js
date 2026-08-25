@@ -62,8 +62,10 @@ export function toOpenAiBody({ system, messages, tools, maxTokens, maxTokensPara
       // since the block stays in the transcript.
       if (text || thinking || toolCalls.length > 0) out.push(msg);
     } else {
-      // tool messages must precede the turn's user text.
-      const texts = [];
+      // tool messages must precede the turn's user text/images; text and image parts keep their
+      // original order so each image stays adjacent to its own instruction (the Anthropic wire does).
+      // Content-parts form only when images are present — text-only stays a plain string.
+      const parts = [];
       for (const b of m.content) {
         if (b?.type === "tool_result") {
           out.push({
@@ -72,11 +74,17 @@ export function toOpenAiBody({ system, messages, tools, maxTokens, maxTokensPara
             content: typeof b.content === "string" ? b.content : JSON.stringify(b.content ?? ""),
           });
         } else if (b?.type === "text") {
-          texts.push(b.text ?? "");
+          parts.push({ type: "text", text: b.text ?? "" });
+        } else if (b?.type === "image" && b.source?.type === "base64" && b.source.data) {
+          parts.push({ type: "image_url", image_url: { url: `data:${b.source.media_type};base64,${b.source.data}` } });
         }
       }
-      const text = texts.join("\n");
-      if (text) out.push({ role: m.role, content: text });
+      if (parts.some((pt) => pt.type === "image_url")) {
+        out.push({ role: m.role, content: parts });
+      } else {
+        const text = parts.map((pt) => pt.text).join("\n");
+        if (text) out.push({ role: m.role, content: text });
+      }
     }
   }
   const body = { model, [maxTokensParam || "max_tokens"]: maxTokens, messages: out };

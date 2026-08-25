@@ -464,3 +464,6 @@ body.preview-expanded #preview-iframe { min-height: 80vh; }
   .turn-body .streaming::after { animation: none; }
   * { transition: none !important; }
 }
+
+.upload-chip.vision { border-style: dashed; }
+.msg-attachments { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.35rem; }

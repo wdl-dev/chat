@@ -186,3 +186,51 @@ export function isUserTextTurn(row, text) {
   const content = parseJson(row.content);
   return Array.isArray(content) && content.length === 1 && content[0]?.type === "text" && content[0]?.text === text;
 }
+
+// image_ref markers keep base64 out of message rows and stream replay; the wire needs real blocks.
+// Inflation budgets total image bytes per request, newest-first: a window dense with image turns
+// must not cross provider request-body caps, so the oldest images degrade to placeholder text.
+// Two-phase on purpose: sizes decide the kept set first, and only kept bodies are ever loaded —
+// a window can reference far more image bytes than the budget, and loading evicted bodies would
+// spike DO memory by that difference. A marker whose row is gone is dropped; a turn that would
+// empty out gets a placeholder (an empty user turn 400s strict providers).
+const IMAGE_OMITTED = "[earlier attached image omitted to fit the request]";
+export const DEFAULT_IMAGE_BUDGET = 8 * 1024 * 1024;
+export function inflateImageRefs(messages, { meta, data }, { imageBudget = DEFAULT_IMAGE_BUDGET, vision = true } = {}) {
+  if (!vision) imageBudget = 0; // text-only deployment: every marker degrades to placeholder text
+  const metas = new Map();
+  const kept = new Set();
+  let budget = imageBudget;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "user" || !Array.isArray(m.content)) continue;
+    for (let j = m.content.length - 1; j >= 0; j--) {
+      const b = m.content[j];
+      if (b?.type !== "image_ref") continue;
+      const info = meta(b.id);
+      if (!(typeof info?.media_type === "string" && Number.isInteger(info?.size) && info.size > 0)) continue;
+      const key = `${i}:${j}`;
+      metas.set(key, info);
+      if (info.size <= budget) { budget -= info.size; kept.add(key); }
+    }
+  }
+  return messages.map((m, i) => {
+    if (m.role !== "user" || !Array.isArray(m.content)) return m;
+    if (!m.content.some(b => b?.type === "image_ref")) return m;
+    const content = [];
+    m.content.forEach((b, j) => {
+      if (b?.type !== "image_ref") { content.push(b); return; }
+      const key = `${i}:${j}`;
+      const info = metas.get(key);
+      if (!info) return;
+      const body = kept.has(key) ? data(b.id) : null;
+      if (typeof body === "string" && body) {
+        content.push({ type: "image", source: { type: "base64", media_type: info.media_type, data: body } });
+      } else {
+        content.push({ type: "text", text: IMAGE_OMITTED });
+      }
+    });
+    if (content.length === 0) content.push({ type: "text", text: "[attached image unavailable]" });
+    return { role: m.role, content };
+  });
+}

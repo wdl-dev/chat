@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildRequestBody, callLlmMessages, resolveLlmConfig, pickModel } from "../src/llm.js";
+import { buildRequestBody, callLlmMessages, pickModel, resolveLlmConfig, visionEnabled } from "../src/llm.js";
 import { streamFromChunks, streamFromString, streamThenError } from "./_stream.js";
 
 test("buildRequestBody composes minimal body", () => {
@@ -618,4 +618,35 @@ test("a 200-status error body is a provider failure, not an empty model reply", 
   await assert.rejects(
     () => callLlmMessages({ env: { LLM_API_KEY: "k" }, messages: [{ role: "user", content: "hi" }], fetcher: async () => res }),
     /provider returned an error/);
+});
+
+test("pickModel: an image-bearing user turn is intent, not a continuation", () => {
+  const cfg = { model: "pro", modelLite: "flash" };
+  assert.equal(pickModel([
+    { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "x" } }] },
+  ], cfg), "pro");
+  assert.equal(pickModel([
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "x" }] },
+  ], cfg), "flash");
+});
+
+test("pickModel: a tool continuation with images still in the window stays on the full model", () => {
+  const cfg = { model: "vision", modelLite: "flash" };
+  const withImage = [
+    { role: "user", content: [
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "x" } },
+      { type: "text", text: "look" },
+    ] },
+    { role: "assistant", content: [{ type: "tool_use", id: "t", name: "read_file", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "x" }] },
+  ];
+  assert.equal(pickModel(withImage, cfg), "vision");
+  assert.equal(pickModel(withImage.slice(1), cfg), "flash");
+});
+
+test("visionEnabled: only the explicit \"1\" turns vision on", () => {
+  assert.equal(visionEnabled({ LLM_VISION: "1" }), true);
+  for (const v of [undefined, "", "0", "true", 1]) {
+    assert.equal(visionEnabled({ LLM_VISION: v }), false, String(v));
+  }
 });

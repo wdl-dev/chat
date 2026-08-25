@@ -249,7 +249,7 @@ const ZH = {
     `\n\n# 用户最初的请求（锚点）\n\n> ${anchor.slice(0, 1000)}\n\n这是本次会话的锚点。即使中间历史被截断，也照这个意图推进。**如果这个请求已经完成（部署 + 验证过且 preview 正常），立即用纯文本 summary 结束本轮，绝不再调任何工具。**`,
 
   assetsSuffix: (names) =>
-    `\n\n# 用户上传的素材\n\n用户把这些文件传到了 \`./assets\`，用你的文件工具（read_file / list_files / run_command）读取，并在项目里按需使用（图片等二进制资源：复制 / 引用到对应位置，不要试图当文本读）：${names.join("、")}。`,
+    `\n\n# 用户上传的素材\n\n用户把这些文件传到了 \`./assets\`，用你的文件工具（read_file / list_files / run_command）读取，并在项目里按需使用（图片等二进制资源：复制 / 引用到对应位置，不要试图当文本读）：${names.join("、")}。用户随聊天消息附上的图片会直接以图像形式展示给你；同名原始文件也在 \`./assets\`。`,
 };
 
 const EN = {
@@ -350,7 +350,7 @@ The platform is still WDL (self-hosted workerd, not Cloudflare Workers): use pnp
     `\n\n# The user's original request (anchor)\n\n> ${anchor.slice(0, 1000)}\n\nThis is the anchor for the session. Even if the middle of the history gets truncated, keep pushing toward this intent. **If this request is already done (deployed + verified and the preview works), end this turn immediately with a plain-text summary and never call another tool.**`,
 
   assetsSuffix: (names) =>
-    `\n\n# User-uploaded materials\n\nThe user uploaded these files to \`./assets\` — read them with your file tools (read_file / list_files / run_command) and use them in the project as appropriate (for binary assets like images: copy / reference them into place, don't try to read them as text): ${names.join(", ")}.`,
+    `\n\n# User-uploaded materials\n\nThe user uploaded these files to \`./assets\` — read them with your file tools (read_file / list_files / run_command) and use them in the project as appropriate (for binary assets like images: copy / reference them into place, don't try to read them as text): ${names.join(", ")}. Images the user attaches to a chat message are shown to you directly as images; the same-named originals are also in \`./assets\`.`,
 };
 
 const PACKS = { en: EN, zh: ZH };

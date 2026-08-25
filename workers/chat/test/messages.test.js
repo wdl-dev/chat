@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { healMessages, isUserTextTurn, replayLlmTurnOutcome, replayPlanOutcome, toolBatchAlreadyRan, windowLlmMessages } from "../src/messages.js";
+import { healMessages, inflateImageRefs, isUserTextTurn, replayLlmTurnOutcome, replayPlanOutcome, toolBatchAlreadyRan, windowLlmMessages } from "../src/messages.js";
 
 function asst(...blocks) { return { role: "assistant", content: blocks }; }
 function user(...blocks) { return { role: "user", content: blocks }; }
@@ -294,4 +294,77 @@ test("coalesceRoles keeps thinking blocks leading when merging assistant turns",
     if (b.type === "thinking") assert.ok(!sawNonThinking, "a thinking block followed a non-thinking block");
     else sawNonThinking = true;
   }
+});
+
+const attStore = (entries) => {
+  const m = new Map(entries);
+  const dataReads = [];
+  return {
+    dataReads,
+    cb: {
+      meta: (id) => m.has(id) ? { media_type: m.get(id).media_type, size: m.get(id).data.length } : null,
+      data: (id) => { dataReads.push(id); return m.get(id)?.data ?? null; },
+    },
+  };
+};
+
+test("inflateImageRefs: markers become base64 blocks; missing rows drop; an emptied turn gets a placeholder", () => {
+  const msgs = [
+    { role: "user", content: [{ type: "image_ref", id: 1, name: "a.png", media_type: "image/png" }, { type: "text", text: "make this" }] },
+    { role: "assistant", content: [{ type: "text", text: "ok" }] },
+    { role: "user", content: [{ type: "image_ref", id: 9 }] },
+    { role: "user", content: "plain string" },
+  ];
+  const store = attStore([[1, { media_type: "image/png", data: "QUJD" }]]);
+  const out = inflateImageRefs(msgs, store.cb);
+  assert.deepEqual(out[0].content, [
+    { type: "image", source: { type: "base64", media_type: "image/png", data: "QUJD" } },
+    { type: "text", text: "make this" },
+  ]);
+  assert.deepEqual(out[1], msgs[1]);
+  assert.deepEqual(out[2].content, [{ type: "text", text: "[attached image unavailable]" }]);
+  assert.equal(out[3].content, "plain string");
+});
+
+test("windowLlmMessages: image_ref blocks ride through healing, stripTools, and coalescing", () => {
+  const raw = [
+    { role: "user", content: [{ type: "text", text: "start" }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "read_file", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "x" }] },
+    { role: "user", content: [{ type: "image_ref", id: 3, name: "m.png", media_type: "image/png" }, { type: "text", text: "look" }] },
+  ];
+  const out = windowLlmMessages(raw);
+  assert.ok(out[out.length - 1].content.some(b => b.type === "image_ref"));
+  const stripped = windowLlmMessages(raw, { stripTools: true });
+  assert.ok(stripped[stripped.length - 1].content.some(b => b.type === "image_ref"));
+});
+
+test("inflateImageRefs: budget keeps the newest images, elides the oldest, and never loads evicted bodies", () => {
+  const att = (n) => ({ media_type: "image/png", data: "A".repeat(n) });
+  const entries = [[1, att(10)], [2, att(10)], [3, att(10)]];
+  const msgs = [
+    { role: "user", content: [{ type: "image_ref", id: 1 }, { type: "text", text: "one" }] },
+    { role: "assistant", content: [{ type: "text", text: "ok" }] },
+    { role: "user", content: [{ type: "image_ref", id: 2 }, { type: "image_ref", id: 3 }, { type: "text", text: "two" }] },
+  ];
+  const store = attStore(entries);
+  const out = inflateImageRefs(msgs, store.cb, { imageBudget: 20 });
+  assert.equal(out[0].content[0].type, "text");
+  assert.match(out[0].content[0].text, /omitted/);
+  assert.equal(out[2].content[0].type, "image");
+  assert.equal(out[2].content[1].type, "image");
+  // Peak memory contract: the evicted attachment's body was never read.
+  assert.deepEqual(store.dataReads.sort(), [2, 3]);
+  const roomy = attStore(entries);
+  assert.equal(inflateImageRefs(msgs, roomy.cb, { imageBudget: 30 })[0].content[0].type, "image");
+  assert.deepEqual(roomy.dataReads.sort(), [1, 2, 3]);
+});
+
+test("inflateImageRefs: vision disabled degrades every marker to text and never reads a body", () => {
+  const store = attStore([[1, { media_type: "image/png", data: "QUJD" }]]);
+  const msgs = [{ role: "user", content: [{ type: "image_ref", id: 1 }, { type: "text", text: "hi" }] }];
+  const out = inflateImageRefs(msgs, store.cb, { vision: false });
+  assert.equal(out[0].content[0].type, "text");
+  assert.match(out[0].content[0].text, /omitted/);
+  assert.deepEqual(store.dataReads, []);
 });
