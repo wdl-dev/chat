@@ -70,7 +70,8 @@ fi
 DELETED=0 PINNED=0
 while IFS= read -r v; do
   [[ -z "$v" ]] && continue
-  if OUT="$("$WDL_BIN" delete version "$WORKER" "$v" --ns "$NS" 2>&1)"; then
+  # --yes: CLI >= 1.8.1 requires confirmation for `delete version`, and this runs unattended.
+  if OUT="$("$WDL_BIN" delete version "$WORKER" "$v" --ns "$NS" --yes 2>&1)"; then
     DELETED=$((DELETED + 1))
   elif [[ "$OUT" == *version_referenced* ]]; then
     PINNED=$((PINNED + 1))
