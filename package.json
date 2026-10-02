@@ -27,7 +27,7 @@
     "bootstrap": "node scripts/bootstrap.js"
   },
   "devDependencies": {
-    "@wdl-dev/cli": "1.8.1",
+    "@wdl-dev/cli": "1.9.2",
     "playwright": "1.56.1"
   },
   "engines": {
